@@ -1,0 +1,20 @@
+# Build output
+app/build/
+*.app/
+
+# Generated at build time from make-icon.py
+app/icon-preview.png
+
+# Working files from conversions
+*.264
+*.sup
+*.mkv
+*.preview.png
+*.progress
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

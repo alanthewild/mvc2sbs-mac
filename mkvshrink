@@ -1,0 +1,1989 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Alan Wild
+# ---------------------------------------------------------------------------
+# mkvshrink - re-encode H.264 MKV files to HEVC to reclaim disk, and drop the
+#             audio and subtitle tracks you will never play.
+#
+# Pipeline, per file:
+#   1. mkvmerge -J   read tracks, flags, languages, stereo mode, display size
+#   2. mkvmerge      cut a few short sample windows, video only
+#   3. ffmpeg        encode the samples, measure size ratio and PSNR
+#   4. ffmpeg        encode the full video track to a staging file
+#   5. mkvmerge      build the file you keep: new video, chosen tracks from the
+#                    source, chapters carried across, provenance tags
+#   6. mkvpropedit   restore StereoMode and display dimensions
+#   7. verify        length, startup, Cues, chapters, stereo, then and only then
+#                    is the original touched
+#
+# Audio and subtitles are never re-encoded and never pass through FFmpeg. They
+# go straight from the source into the output via mkvmerge.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+VERSION="3.26"
+# Increments on every build handed over, including ones that never reach a
+# release. VERSION alone answers "which release", and during a week of
+# iteration that is eight different scripts all claiming 3.26. BUILD is what
+# tells you which of them wrote a given file, and it is stamped into the
+# output for exactly that reason.
+BUILD="18"
+
+# ------------------------------- defaults ----------------------------------
+ENCODER=vt            # vt | x265
+VTQUALITY=62
+CRF=20
+PRESET=slow
+TENBIT=1
+MINSAVING=10          # percent
+MINSIZE=5368709120    # 5 GB. Below this there is no meaningful disk to reclaim.
+MINPSNR=40            # dB, probe encode against the source samples
+REPLACE=folder        # folder | insitu | none
+REPLACEDIR=""         # empty means a _replaced folder beside each file
+RECURSE=1
+SKIPHEVC=1
+ALLOWHDR=0
+ALLOWINTERLACED=0
+SUBLANGS="eng,en,und"
+AUDIOLANGS="eng,en"
+KEEPCOMMENTARY=1
+KEEPFORCED=1
+NOTRACKS=0            # --keep-all-tracks: do not drop anything
+PROBECOUNT=3
+PROBELEN=20
+PLANOUT=""
+APPLYIN=""
+CALIBRATE=""
+CALIBRATE_AT=""
+CALIBRATE_LEN=60
+KEEPCLIPS=0
+DARKEST=1
+INTERACTIVE=0
+ATRACKS=""
+STRACKS=""
+TMPROOT=""
+DRYRUN=0
+MACHINE=0
+FORCE=0
+VERIFY_FULL=0
+SETPARAMS=""
+SP_PRIM=bt709; SP_TRC=bt709; SP_SPC=bt709; SP_RANGE=tv
+PE_RATIO=""; PE_PSNR=""; PE_SSIM=""; PE_PROBES=0
+PROGRESS_DUR=""; PROGRESS_NAME=""
+STRIP_SAVE="0.0"; ENC_GAIN="0.0"
+
+usage() {
+  cat <<EOF
+mkvshrink $VERSION
+
+  mkvshrink [options] PATH...            shrink files or folders now
+  mkvshrink --plan FILE PATH...          write a plan, change nothing
+  mkvshrink --apply FILE                 carry out an edited plan
+  mkvshrink --calibrate FILE             measure settings on your own footage
+
+What it does
+  Re-encodes the video track to HEVC and drops the audio and subtitle tracks
+  the rules below decide you will never play. Both parts are independent: a
+  file that is already HEVC, or that would barely shrink, can still be worth
+  rewriting for the tracks alone.
+
+  Nothing is destroyed until the output has passed every check.
+
+Options
+      --plan FILE       probe everything, write a plan file, exit. This is the
+                        way to sweep a library: read the decisions as a table,
+                        fix the handful the rules got wrong, then --apply.
+      --apply FILE      carry out a plan file
+      --calibrate FILE  encode one clip at several settings against the source
+                        and print size, PSNR, SSIM and time. Do this once per
+                        kind of content before sweeping. The defaults were
+                        measured on 3840x1080 3D and do not transfer.
+      --calibrate-at T  where to cut the calibration clip (default: 40% in)
+      --calibrate-len N seconds of calibration clip (default $CALIBRATE_LEN)
+      --no-darkest      cut the calibration clip at the midpoint rather than
+                        hunting for the darkest scene. Dark scenes are where
+                        banding and crushed blacks show, so that is where the
+                        clip is taken from by default.
+      --keep-clips      keep the calibration clips instead of deleting them, so
+                        the encodes can be compared by eye. PSNR and SSIM do not
+                        see banding or black crush; looking at the file does.
+
+  Encoding
+      --x265            libx265 instead of VideoToolbox. About 8% smaller and
+                        about 25 times slower.
+      --vt-quality N    VideoToolbox quality 1-100 (default $VTQUALITY). Not a
+                        CRF: higher is better.
+  -q, --crf N           x265 CRF (default $CRF)
+  -p, --preset P        x265 preset (default $PRESET)
+      --8bit            encode 8-bit. 10-bit is the default and costs nothing.
+
+  What to skip
+      --min-saving PCT  skip the re-encode when the predicted saving is under
+                        this (default $MINSAVING). Measured with a probe encode,
+                        not guessed from bitrate.
+      --min-psnr DB     reject an encode whose probe PSNR against the source is
+                        below this (default $MINPSNR). Calibrate this. The
+                        default is a starting point, not a measurement.
+      --min-size SIZE   skip files smaller than this outright, before probing
+                        (default 5G). Accepts 5G, 500M, 1.5T; a bare number is
+                        gigabytes. A small file is small because it was already
+                        encoded at a low bitrate, so the encode inflates it and
+                        it gets rejected anyway, after three probe encodes have
+                        been spent finding that out.
+      --no-min-size     probe every file however small
+      --no-skip-hevc    re-encode files that are already HEVC
+      --allow-hdr       do not skip HDR files. Read the warning first.
+      --allow-interlaced  do not skip interlaced files
+      --force           ignore every skip rule
+
+  Tracks
+      --audio-langs L   audio languages to keep (default $AUDIOLANGS). The first
+                        audio track is always kept whatever its language, which
+                        is what makes this work on foreign films.
+      --sub-langs L     subtitle languages to keep (default $SUBLANGS)
+      --no-commentary   drop commentary tracks (kept by default: they are not
+                        recoverable)
+      --no-forced       drop forced subtitles that fail the language filter.
+                        Forced subs carry the alien dialogue in an English
+                        film, so this loses lines nothing else covers.
+      --keep-all-tracks do not drop anything
+      --audio LIST      explicit mkvmerge track IDs, one input file only
+      --subs LIST       same for subtitles. "none" is allowed.
+  -i, --interactive     show the track table and confirm, per file
+
+  Originals
+      --in-situ         replace the original in place once checks pass
+      --keep-originals  write beside the original and touch nothing
+      --replaced-dir D  put replaced originals under D, mirroring their path
+                        (default: a _replaced folder beside each file)
+
+  Other
+      --no-recurse      do not descend into subfolders
+      --temp DIR        scratch directory (default: beside the output)
+      --verify-quality  measure PSNR over the whole file after encoding, not
+                        just the probe. Roughly doubles the time.
+      --machine         emit machine-readable @@ lines on stdout
+  -n, --dry-run         print what would happen and exit
+  -V, --version         print the version and exit
+  -h, --help            this text
+
+Examples
+  mkvshrink --calibrate /Volumes/Media/Film.mkv
+  mkvshrink --plan sweep.tsv /Volumes/Media/Films
+  \$EDITOR sweep.tsv
+  mkvshrink --apply sweep.tsv
+  mkvshrink --audio 1 --subs 4 Film.mkv
+EOF
+}
+
+say()  { printf '\033[1;36m==>\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; mach "@@warn $*"; }
+die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; mach "@@error $*"; exit 1; }
+# Machine-readable status for GUI front ends. Human text always goes to stderr,
+# so stdout carries nothing but @@ lines and stays trivially parseable.
+mach() { if [[ ${MACHINE:-0} -eq 1 ]]; then printf '%s\n' "${*//$'\n'/ }"; fi; }
+
+# "12", "12G", "500M", "1.5T". Bare numbers are gigabytes, because nobody
+# passes --min-size in bytes and silently reading 5 as five bytes would make
+# the gate do nothing at all.
+# Bytes back to something readable, so the banner and the plan header do not
+# say "min-size=0.00977G".
+human_size() {
+  python3 -c '
+import sys
+n = int(sys.argv[1])
+if n <= 0:
+    print("off"); raise SystemExit
+for unit, mult in (("T", 1024**4), ("G", 1024**3), ("M", 1024**2), ("K", 1024)):
+    if n >= mult:
+        v = n / mult
+        print(("%d%s" % (v, unit)) if abs(v - round(v)) < 0.05 else ("%.1f%s" % (v, unit)))
+        raise SystemExit
+print("%dB" % n)
+' "$1"
+}
+
+parse_size() {
+  python3 -c '
+import re, sys
+s = sys.argv[1].strip().upper()
+m = re.match(r"^([0-9]*\.?[0-9]+)\s*([KMGT]?)B?$", s)
+if not m:
+    sys.stderr.write("not a size: %s\n" % sys.argv[1]); sys.exit(1)
+n = float(m.group(1))
+mult = {"": 1024**3, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+print(int(n * mult[m.group(2)]))
+' "$1" || die "--min-size wants something like 5G, 500M or 1.5T"
+}
+
+# ------------------------------- args --------------------------------------
+INPUTS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --plan)            PLANOUT="$2"
+                       # "--plan /Volumes/video/Anime" reads as a plan named
+                       # after the folder you meant to scan, and then there are
+                       # no inputs left. Catch it here rather than printing
+                       # usage into the file the redirect just created.
+                       [[ -d "$PLANOUT" ]] && die "--plan takes the plan filename
+      first, then the folders to scan:
+        mkvshrink --plan plan.tsv \"$PLANOUT\""
+                       case "$PLANOUT" in
+                         *.mkv|*.MKV) die "--plan wants a plan filename, not a video file" ;;
+                       esac
+                       shift 2 ;;
+    --apply)           APPLYIN="$2"; shift 2 ;;
+    --calibrate)       CALIBRATE="$2"; shift 2 ;;
+    --calibrate-at)    CALIBRATE_AT="$2"; shift 2 ;;
+    --calibrate-len)   CALIBRATE_LEN="$2"; shift 2 ;;
+    --keep-clips)      KEEPCLIPS=1; shift ;;
+    --no-darkest)      DARKEST=0; shift ;;
+    --x265)            ENCODER=x265; shift ;;
+    --vt-quality)      VTQUALITY="$2"; shift 2 ;;
+    -q|--crf)          CRF="$2"; shift 2 ;;
+    -p|--preset)       PRESET="$2"; shift 2 ;;
+    --8bit)            TENBIT=0; shift ;;
+    --min-saving)      MINSAVING="$2"; shift 2 ;;
+    --min-size)        MINSIZE="$(parse_size "$2")"; shift 2 ;;
+    --no-min-size)     MINSIZE=0; shift ;;
+    --min-psnr)        MINPSNR="$2"; shift 2 ;;
+    --probes)          PROBECOUNT="$2"; shift 2 ;;
+    --probe-len)       PROBELEN="$2"; shift 2 ;;
+    --no-probe)        PROBECOUNT=0; shift ;;
+    --no-skip-hevc)    SKIPHEVC=0; shift ;;
+    --allow-hdr)       ALLOWHDR=1; shift ;;
+    --allow-interlaced) ALLOWINTERLACED=1; shift ;;
+    --force)           FORCE=1; shift ;;
+    --audio-langs)     AUDIOLANGS="$2"; shift 2 ;;
+    --sub-langs)       SUBLANGS="$2"; shift 2 ;;
+    --no-commentary)   KEEPCOMMENTARY=0; shift ;;
+    --no-forced)       KEEPFORCED=0; shift ;;
+    --keep-all-tracks) NOTRACKS=1; shift ;;
+    --audio)           ATRACKS="$2"; shift 2 ;;
+    --subs)            STRACKS="$2"; shift 2 ;;
+    -i|--interactive)  INTERACTIVE=1; shift ;;
+    --in-situ|--in-place) REPLACE=insitu; shift ;;
+    --keep-originals)  REPLACE=none; shift ;;
+    --replaced-dir)    REPLACEDIR="$2"; shift 2 ;;
+    --no-recurse)      RECURSE=0; shift ;;
+    --temp)            TMPROOT="$2"; shift 2 ;;
+    --verify-quality)  VERIFY_FULL=1; shift ;;
+    --machine)         MACHINE=1; shift ;;
+    -n|--dry-run)      DRYRUN=1; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    -V|--version)      echo "mkvshrink $VERSION build $BUILD"; exit 0 ;;
+    -*)                die "unknown option: $1" ;;
+    *)                 INPUTS+=("$1"); shift ;;
+  esac
+done
+
+case "$ENCODER" in vt|x265) ;; *) die "bad encoder: $ENCODER" ;; esac
+[[ "$MINSAVING" =~ ^[0-9]+$ ]] || die "--min-saving takes a whole number of percent"
+
+# Explicit track IDs mean nothing across files. Silently applying "--audio 1,3"
+# to a folder would keep an arbitrary track in every one of them.
+if [[ -n "$ATRACKS" || -n "$STRACKS" ]]; then
+  [[ ${#INPUTS[@]} -eq 1 ]] || die "--audio and --subs take one input file.
+      Track IDs are per file. For a sweep use --plan, edit the table, --apply."
+  [[ -f "${INPUTS[0]}" ]] || die "--audio and --subs take a file, not a folder"
+fi
+
+# ------------------------------- tools -------------------------------------
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 not found in PATH.
+      brew install ffmpeg mkvtoolnix"; }
+need ffmpeg; need ffprobe; need mkvmerge; need mkvextract; need mkvpropedit
+need python3
+
+mach "@@version $VERSION"
+
+# ---------------------------- probe helper ---------------------------------
+# One Python pass over mkvmerge -J and ffprobe -show_streams, because the two
+# tools each know things the other does not. mkvmerge has the track IDs the
+# muxer will use, the flags, the stereo mode and the display dimensions.
+# ffprobe has the pixel format, the colour tags, the field order and the
+# NUMBER_OF_BYTES statistics tags that say what each track actually costs.
+read -r -d '' PROBE_PY <<'PROBEPY' || true
+import json, shlex, sys
+
+mkv_path, ff_path, table_path = sys.argv[1], sys.argv[2], sys.argv[3]
+sub_langs = [x.strip().lower() for x in sys.argv[4].split(",") if x.strip()]
+aud_langs = [x.strip().lower() for x in sys.argv[5].split(",") if x.strip()]
+keep_comm = sys.argv[6] == "1"
+keep_forced = sys.argv[7] == "1"
+keep_all = sys.argv[8] == "1"
+
+out = {}
+
+
+def emit():
+    for k, v in out.items():
+        print("%s=%s" % (k, shlex.quote(str(v))))
+
+
+try:
+    mk = json.load(open(mkv_path, encoding="utf-8"))
+except Exception as e:
+    out["OK"] = 0
+    out["ERR"] = "mkvmerge could not read the file: %s" % e
+    emit()
+    sys.exit(0)
+
+try:
+    ff = json.load(open(ff_path, encoding="utf-8"))
+except Exception:
+    ff = {"streams": [], "format": {}}
+
+mk_tracks = mk.get("tracks", [])
+ff_streams = ff.get("streams", [])
+
+
+def norm(t):
+    return {"subtitle": "subtitles"}.get(t, t)
+
+
+# Both tools list tracks in file order, so position n means the same track in
+# each. That is an assumption, so check it rather than trust it: if the type
+# sequences disagree the byte figures are matched to the wrong tracks and every
+# prediction downstream is quietly wrong.
+mk_types = [t.get("type") for t in mk_tracks]
+ff_types = [norm(s.get("codec_type")) for s in ff_streams
+            if norm(s.get("codec_type")) in ("video", "audio", "subtitles")]
+aligned = mk_types == ff_types
+ff_by_pos = {}
+if aligned:
+    n = 0
+    for s in ff_streams:
+        if norm(s.get("codec_type")) in ("video", "audio", "subtitles"):
+            ff_by_pos[n] = s
+            n += 1
+
+fmt = ff.get("format", {})
+try:
+    duration = float(fmt.get("duration", 0))
+except Exception:
+    duration = 0.0
+try:
+    total_bytes = int(fmt.get("size", 0))
+except Exception:
+    total_bytes = 0
+
+
+def stream_bytes(s, dur):
+    """What this track costs, from the statistics tags if the file has them."""
+    if not s:
+        return 0
+    tags = {k.lower(): v for k, v in (s.get("tags") or {}).items()}
+    for k, v in tags.items():
+        if k.startswith("number_of_bytes"):
+            try:
+                return int(v)
+            except Exception:
+                pass
+    # MakeMKV and mkvmerge both write those tags, so most of a library will
+    # just answer. Falling back to bitrate is a guess and is flagged as one.
+    br = s.get("bit_rate") or tags.get("bps") or tags.get("bps-eng")
+    try:
+        if br and dur > 0:
+            return int(float(br) * dur / 8.0)
+    except Exception:
+        pass
+    return 0
+
+
+video = None
+audio = []
+subs = []
+for pos, t in enumerate(mk_tracks):
+    p = t.get("properties", {}) or {}
+    s = ff_by_pos.get(pos)
+    rec = {
+        "pos": pos,
+        "id": t.get("id"),
+        "type": t.get("type"),
+        "codec_id": p.get("codec_id", "") or "",
+        "codec": t.get("codec", "") or "",
+        "lang": (p.get("language") or "und").lower(),
+        "name": p.get("track_name", "") or "",
+        "default": 1 if p.get("default_track") else 0,
+        "forced": 1 if p.get("forced_track") else 0,
+        "commentary": 1 if p.get("flag_commentary") else 0,
+        "hi": 1 if p.get("flag_hearing_impaired") else 0,
+        "channels": p.get("audio_channels", "") or "",
+        "bytes": stream_bytes(s, duration),
+        "est": 0 if (s and any(k.lower().startswith("number_of_bytes")
+                               for k in (s.get("tags") or {}))) else 1,
+    }
+    if t.get("type") == "video":
+        rec["pix"] = (s or {}).get("pix_fmt", "") or ""
+        rec["w"] = p.get("pixel_dimensions", "0x0").split("x")[0]
+        rec["h"] = p.get("pixel_dimensions", "0x0").split("x")[-1]
+        rec["stereo"] = p.get("stereo_mode", 0) or 0
+        rec["disp"] = p.get("display_dimensions", "") or ""
+        rec["trc"] = (s or {}).get("color_transfer", "") or ""
+        rec["prim"] = (s or {}).get("color_primaries", "") or ""
+        rec["spc"] = (s or {}).get("color_space", "") or ""
+        rec["range"] = (s or {}).get("color_range", "") or ""
+        rec["field"] = (s or {}).get("field_order", "") or ""
+        if video is None:
+            video = rec
+    elif t.get("type") == "audio":
+        audio.append(rec)
+    elif t.get("type") == "subtitles":
+        subs.append(rec)
+
+if video is None:
+    out["OK"] = 0
+    out["ERR"] = "no video track"
+    emit()
+    sys.exit(0)
+
+
+def is_sdh(rec):
+    if rec["hi"]:
+        return True
+    n = rec["name"].lower()
+    return any(w in n for w in ("sdh", "hearing", "caption", " cc", "cc "))
+
+
+def is_commentary(rec):
+    if rec["commentary"]:
+        return True
+    n = rec["name"].lower()
+    return "commentary" in n or "director" in n
+
+
+# --- the rules -------------------------------------------------------------
+# Subtitles: language whitelist, plus every forced track whatever its language.
+# A forced French track on an English film carries dialogue that no English
+# track duplicates, so dropping it loses content rather than duplication.
+sub_keep = []
+for r in subs:
+    why = ""
+    if keep_all:
+        why = "keep-all"
+    elif r["lang"] in sub_langs:
+        why = "lang"
+    elif keep_forced and r["forced"]:
+        why = "forced"
+    if why:
+        sub_keep.append(r)
+    r["why"] = why
+
+# Audio: keep the language whitelist, and always keep the first audio track
+# whatever it is. On an English film track 1 is English and the dubs go. On a
+# foreign film track 1 is the original language and it stays, along with an
+# English dub if the disc carried one. Where this is wrong it keeps a track it
+# did not need to, which is the cheap direction to be wrong in.
+aud_keep = []
+for i, r in enumerate(audio):
+    why = ""
+    if keep_all:
+        why = "keep-all"
+    elif i == 0:
+        why = "first"
+    elif r["lang"] in aud_langs:
+        why = "lang"
+    elif keep_comm and is_commentary(r):
+        why = "commentary"
+    if why:
+        aud_keep.append(r)
+    r["why"] = why
+
+# Any whitelist meets a file tagged in a way nobody anticipated. Losing every
+# audio track is a mute film; keeping a few megabytes of Spanish is nothing.
+warnings = []
+if audio and not aud_keep:
+    aud_keep = list(audio)
+    for r in audio:
+        r["why"] = "fallback"
+    warnings.append("no audio track matched the rules, so all were kept")
+if subs and not sub_keep:
+    sub_keep = list(subs)
+    for r in subs:
+        r["why"] = "fallback"
+    warnings.append("no subtitle track matched the rules, so all were kept")
+
+# --- default flags ---------------------------------------------------------
+# Dropping the track that carried the default flag leaves a file with no
+# default at all, and players then pick whatever they feel like. Which track
+# was default is reported here; whether it survived can only be decided against
+# the list of tracks actually kept, which may have been edited by hand since.
+def default_id(tracks):
+    for r in tracks:
+        if r["default"]:
+            return str(r["id"])
+    return ""
+
+
+out["OK"] = 1
+out["DURATION"] = "%.3f" % duration
+out["TOTAL_BYTES"] = total_bytes
+out["SEGUID"] = (mk.get("container", {}).get("properties", {}) or {}).get(
+    "segment_uid", "")
+out["ALIGNED"] = 1 if aligned else 0
+
+out["VID_ID"] = video["id"]
+out["VID_CODEC"] = video["codec_id"]
+out["VID_W"] = video["w"]
+out["VID_H"] = video["h"]
+out["VID_PIX"] = video["pix"]
+out["VID_LANG"] = video["lang"]
+out["VID_NAME"] = video["name"]
+out["VID_TRC"] = video["trc"]
+out["VID_PRIM"] = video["prim"]
+out["VID_SPC"] = video["spc"]
+out["VID_RANGE"] = video["range"]
+out["VID_BYTES"] = video["bytes"]
+out["STEREO"] = video["stereo"]
+out["DISP"] = video["disp"]
+
+out["IS_HEVC"] = 1 if "HEVC" in video["codec_id"].upper() or "265" in video[
+    "codec_id"] else 0
+out["IS_HDR"] = 1 if video["trc"] in ("smpte2084", "arib-std-b67") else 0
+out["IS_INTERLACED"] = 0 if video["field"] in ("", "progressive", "unknown") else 1
+out["IS_10BIT"] = 1 if "10" in video["pix"] else 0
+
+out["AUDIO_ALL"] = ",".join(str(r["id"]) for r in audio)
+out["SUBS_ALL"] = ",".join(str(r["id"]) for r in subs)
+out["AUDIO_KEEP"] = ",".join(str(r["id"]) for r in aud_keep)
+out["SUBS_KEEP"] = ",".join(str(r["id"]) for r in sub_keep)
+out["AUDIO_DEFAULT_ID"] = default_id(audio)
+out["SUBS_DEFAULT_ID"] = default_id(subs)
+
+# Which languages lose every one of their tracks. The rule is "whitelist
+# languages, plus the first audio track whatever it is", and that covers a
+# foreign film only when the original language is listed first. On a release
+# that puts the English dub at track 1 and the original at track 4, the
+# original is neither whitelisted nor first, and it is silently dropped. The
+# plan showed "1" in the audio column and nothing about what went, so there
+# was nothing to review. Name the losses instead.
+kept_alangs = {r["lang"] for r in aud_keep}
+lost_alangs = []
+for r in audio:
+    if r["lang"] not in kept_alangs and r["lang"] not in lost_alangs:
+        lost_alangs.append(r["lang"])
+out["AUDIO_LOST_LANGS"] = ",".join(lost_alangs)
+out["AUDIO_KEEP_LANGS"] = ",".join(sorted(kept_alangs))
+
+keep_ids = {r["id"] for r in aud_keep} | {r["id"] for r in sub_keep}
+drop_bytes = sum(r["bytes"] for r in audio + subs if r["id"] not in keep_ids)
+keep_other = sum(r["bytes"] for r in audio + subs if r["id"] in keep_ids)
+out["DROP_BYTES"] = drop_bytes
+out["KEEP_OTHER_BYTES"] = keep_other
+out["EST_BYTES"] = 1 if any(r["est"] for r in [video] + audio + subs) else 0
+out["WARNINGS"] = "; ".join(warnings)
+
+# --- the human readable table ----------------------------------------------
+lines = []
+lines.append("  id  type       codec                 lang  flags        size  keep")
+def fmt_size(b):
+    if not b:
+        return "     ?"
+    return "%6.0fM" % (b / 1048576.0)
+
+
+for r in [video] + audio + subs:
+    flags = []
+    if r["default"]:
+        flags.append("default")
+    if r["forced"]:
+        flags.append("forced")
+    if r["type"] != "video" and is_commentary(r):
+        flags.append("comm")
+    if r["type"] == "subtitles" and is_sdh(r):
+        flags.append("sdh")
+    keep = "yes" if r["type"] == "video" else (
+        "yes (%s)" % r["why"] if r.get("why") else "NO")
+    nm = (" " + r["name"][:28]) if r["name"] else ""
+    lines.append("  %-3s %-10s %-21s %-5s %-12s %s  %s%s" % (
+        r["id"], r["type"], r["codec"][:21], r["lang"],
+        ",".join(flags)[:12], fmt_size(r["bytes"]), keep, nm))
+open(table_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+
+emit()
+PROBEPY
+
+# probe FILE -> sets P_* variables in the caller via eval
+probe_file() {
+  local f="$1" mkjson ffjson
+  mkjson="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.mk.XXXXXX")"
+  ffjson="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.ff.XXXXXX")"
+  P_TABLE="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.tbl.XXXXXX")"
+  mkvmerge -J "$f" > "$mkjson" 2>/dev/null || echo '{}' > "$mkjson"
+  ffprobe -v error -show_streams -show_format -of json "$f" > "$ffjson" 2>/dev/null \
+    || echo '{}' > "$ffjson"
+  local kv
+  kv="$(python3 -c "$PROBE_PY" "$mkjson" "$ffjson" "$P_TABLE" \
+        "$SUBLANGS" "$AUDIOLANGS" "$KEEPCOMMENTARY" "$KEEPFORCED" "$NOTRACKS")"
+  rm -f "$mkjson" "$ffjson"
+  OK=0; ERR=""; WARNINGS=""
+  eval "$kv"
+  P_OK="$OK"; P_ERR="${ERR:-}"
+}
+
+# ---------------------------- decision -------------------------------------
+# What to do with a file, given everything the probe found. Kept separate from
+# doing it, because --plan needs the decision without the work.
+decide() {  # sets D_ACTION D_REASON
+  D_ACTION="shrink"; D_REASON=""
+  if [[ $FORCE -eq 1 ]]; then return 0; fi
+  # Cheapest gate first, before three probe encodes are spent finding out that
+  # a 2 GB WEB-DL was never a candidate. A small file is small because it was
+  # already encoded at a low bitrate, so the ratio comes back above 1 and it
+  # gets rejected anyway, having cost probe time on every run.
+  if [[ "${MINSIZE:-0}" -gt 0 ]] && \
+     [[ "${TOTAL_BYTES:-0}" -lt "$MINSIZE" ]]; then
+    D_ACTION="skip"; D_REASON="under-min-size"; return 0
+  fi
+  if [[ "$IS_HDR" == "1" && $ALLOWHDR -eq 0 ]]; then
+    D_ACTION="skip"; D_REASON="hdr"; return 0
+  fi
+  if [[ "$IS_INTERLACED" == "1" && $ALLOWINTERLACED -eq 0 ]]; then
+    D_ACTION="skip"; D_REASON="interlaced"; return 0
+  fi
+  if [[ "$IS_HEVC" == "1" && $SKIPHEVC -eq 1 ]]; then
+    # Already HEVC is not the same as nothing to do. The tracks may still be
+    # worth hundreds of megabytes, and that is a remux, not an encode.
+    D_ACTION="strip"; D_REASON="already-hevc"; return 0
+  fi
+  return 0
+}
+
+# strip_worth_it: does dropping tracks alone clear the threshold?
+strip_worth_it() {
+  [[ "${DROP_BYTES:-0}" -gt 0 ]] || return 1
+  [[ "${TOTAL_BYTES:-0}" -gt 0 ]] || return 1
+  python3 -c 'import sys
+d, t, m = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+sys.exit(0 if t and (100.0 * d / t) >= m else 1)' "$DROP_BYTES" "$TOTAL_BYTES" "$MINSAVING"
+}
+
+# ---------------------------- encode command --------------------------------
+# Colour is carried across from the source, not asserted.
+#
+# mvc2sbs writes bt709 unconditionally because its input is untagged Y4M out of
+# a decoder. Here the input is a tagged MKV that might be anything, and forcing
+# bt709 onto a BT.2020 file would mislabel it permanently. So setparams repeats
+# what the source says, which keeps the input and the requested output in
+# agreement and stops swscale inserting a full colour round trip through 16-bit
+# RGB on every frame. That conversion announces itself as "No accelerated
+# colorspace conversion found from yuv420p to bgr48le" and only appears at
+# 10-bit, because at 8-bit no scaler is inserted at all. A format= filter does
+# not fix it.
+build_setparams() {
+  local prim="${VID_PRIM:-}" trc="${VID_TRC:-}" spc="${VID_SPC:-}" rng="${VID_RANGE:-}"
+  # An untagged Blu-ray source is Rec.709 in practice, which is also what
+  # every player assumes, so say so rather than leave it unset.
+  [[ -z "$prim" || "$prim" == "unknown" ]] && prim=bt709
+  [[ -z "$trc"  || "$trc"  == "unknown" ]] && trc=bt709
+  [[ -z "$spc"  || "$spc"  == "unknown" ]] && spc=bt709
+  case "$rng" in tv|pc) ;; *) rng=tv ;; esac
+  # Set globals rather than echo them. A command substitution runs in a
+  # subshell, so anything assigned inside one is gone by the time the caller
+  # looks, and the -color_primaries argument built from it is then unset.
+  SP_PRIM="$prim"; SP_TRC="$trc"; SP_SPC="$spc"; SP_RANGE="$rng"
+  SETPARAMS="setparams=color_primaries=${prim}:color_trc=${trc}:colorspace=${spc}:range=${rng}"
+}
+
+pixfmt_for() {
+  if [[ $TENBIT -eq 1 ]]; then
+    [[ "$ENCODER" == "vt" ]] && echo p010le || echo yuv420p10le
+  else
+    echo yuv420p
+  fi
+}
+
+# encode_video SRC DST [EXTRA...]
+# No mapfile, no readarray, no ${x,,}: stock macOS still ships bash 3.2 and
+# the rest of this repository stays inside it.
+encode_video() {
+  local src="$1" dst="$2"; shift 2
+  build_setparams
+  local sp="$SETPARAMS"
+  local -a ff enc
+  if [[ "$ENCODER" == "vt" ]]; then
+    enc=(-c:v hevc_videotoolbox -q:v "$VTQUALITY" -tag:v hvc1)
+  else
+    enc=(-c:v libx265 -preset "$PRESET" -crf "$CRF" -tag:v hvc1)
+  fi
+  local -a stats
+  # A probe is seconds long and there are three per file, so progress there is
+  # noise. The full encode is the one worth reporting on.
+  if [[ -n "${PROGRESS_DUR:-}" && "${PROGRESS_DUR}" != "0" && $DRYRUN -eq 0 ]]; then
+    stats=(-progress pipe:1 -nostats)
+  else
+    stats=(-stats)
+  fi
+  ff=(ffmpeg -hide_banner -loglevel error "${stats[@]}" -nostdin -y
+      -i "$src" -map "0:v:0" -an -sn -dn -map_chapters -1
+      -vf "$sp"
+      "${enc[@]}"
+      -pix_fmt "$(pixfmt_for)"
+      -color_primaries "$SP_PRIM" -color_trc "$SP_TRC"
+      -colorspace "$SP_SPC" -color_range "$SP_RANGE"
+      # Audio is muxed in later from the original file by a different tool, so
+      # the video timestamps have to survive untouched or the two drift apart.
+      -fps_mode passthrough
+      "$@" "$dst")
+  if [[ $DRYRUN -eq 1 ]]; then
+    printf '%q ' "${ff[@]}"; echo
+    return 0
+  fi
+  if [[ -n "${PROGRESS_DUR:-}" && "${PROGRESS_DUR}" != "0" ]]; then
+    # ffmpeg writes the progress stream to stdout, so it is consumed here
+    # rather than shown. The reader puts the console line on stderr and the
+    # machine line on stdout, which keeps --machine output usable by a GUI.
+    "${ff[@]}" | python3 -c "$PROGRESS_PY" "$PROGRESS_DUR" "${PROGRESS_NAME:-}" "$MACHINE"
+    return "${PIPESTATUS[0]}"
+  fi
+  "${ff[@]}"
+}
+
+# ---------------------------- probe encode ----------------------------------
+# Predicting the saving from bitrate and resolution does not work. How much
+# HEVC wins depends almost entirely on how tightly the existing file was
+# already encoded, and nothing in the metadata says that. So encode a little of
+# it and measure. At VideoToolbox speeds this costs seconds.
+#
+# The sample is cut once with mkvmerge --split parts:, video only, so the
+# sample file size is the video size and both the encode and the PSNR
+# comparison start on the identical frame.
+sample_points() {  # $1 = duration seconds. One "START LENGTH" per line.
+  python3 -c '
+import sys
+dur = float(sys.argv[1]); n = int(sys.argv[2]); ln = int(sys.argv[3])
+if dur <= 0:
+    sys.exit(1)
+# Openings are the cheapest minute of most films and credits are cheaper
+# still, so sample the body of it.
+if dur < ln * 6:
+    pts = [max(0.0, dur / 2 - ln / 2)]
+else:
+    pts = [dur * f for f in (0.20, 0.45, 0.70)][:n]
+for p in pts:
+    print("%.3f %d" % (p, min(ln, max(1, int(dur - p)))))
+' "$1" "$PROBECOUNT" "$PROBELEN"
+}
+
+filesize() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null || echo 0; }
+
+
+# Absolute path without realpath, which stock macOS does not have. Directories
+# resolve by cd; files by resolving the directory that holds them.
+abspath() {
+  local p="$1"
+  if [[ -d "$p" ]]; then
+    (cd "$p" 2>/dev/null && pwd) || echo "$p"
+  else
+    local d b
+    d="$(dirname "$p")"; b="$(basename "$p")"
+    d="$(cd "$d" 2>/dev/null && pwd)" || { echo "$p"; return 0; }
+    echo "${d%/}/$b"
+  fi
+}
+
+# default_flag_args KEEPLIST SOURCE_DEFAULT_ID
+# One "ID:FLAG" per line, for every kept track, with exactly one set.
+#
+# Two faults, not one. Dropping the track that carried the default leaves a
+# file with no default, and players then pick whatever they feel like. The
+# other direction is just as common and is not caused by this tool: plenty of
+# library files already carry the default flag on every subtitle track,
+# because whatever built them set it per input file. Keeping three of those
+# gives an output with three defaults. Since every kept track is being named
+# here anyway, state the flag for all of them rather than only patching the
+# case this tool created.
+default_flag_args() {
+  local keep="$1" srcdef="$2" id chosen=""
+  [[ -n "$keep" && "$keep" != "none" ]] || return 0
+  if [[ -n "$srcdef" ]]; then
+    for id in ${keep//,/ }; do
+      [[ "$id" == "$srcdef" ]] && chosen="$id"
+    done
+  fi
+  # The source default did not survive, so promote the first kept track. It is
+  # the first in file order, which is the same track a player would have
+  # landed on by accident, made explicit.
+  [[ -n "$chosen" ]] || chosen="${keep%%,*}"
+  for id in ${keep//,/ }; do
+    if [[ "$id" == "$chosen" ]]; then echo "${id}:1"; else echo "${id}:0"; fi
+  done
+}
+
+# probe_encode SRC WORKDIR -> sets PE_RATIO PE_PSNR PE_SSIM
+probe_encode() {
+  local src="$1" work="$2"
+  # A probe writes only to scratch and deletes it again, so it runs even under
+  # --dry-run. The alternative is a dry run that reports a saving of 94% for
+  # every file because nothing was encoded and the output size was zero, which
+  # is worse than reporting nothing. Bash scopes this dynamically, so
+  # encode_video below sees the override.
+  local DRYRUN=0
+  local psrc penc start len n=0 sa=0 sb=0
+  local psnrs="" ssims=""
+  psrc="$work/probe.src.mkv"
+  penc="$work/probe.enc.mkv"
+
+  # Cut with ffmpeg -ss, not "mkvmerge --split parts:". mkvmerge does not seek:
+  # it reads the source from byte zero and discards everything outside the
+  # windows, so sampling at 70% of a 56 GB remux reads 39 GB across the network
+  # before a single frame is encoded, on a file it may then decide to skip.
+  # ffmpeg seeks, and the cut takes seconds.
+  #
+  # A stream copy cannot split mid-GOP, so the window that comes back starts at
+  # the keyframe at or before the mark and runs to at least PROBELEN. On a long
+  # GOP that is noticeably more than asked for. It costs a little encode time
+  # and changes nothing about the result: the ratio is this window's bytes
+  # against the encode of this same window, whatever length it turned out to be.
+  #
+  # The brief rules out -ss when comparing two encodes, because a seek snaps to
+  # a keyframe and two runs can start on different frames. That does not apply
+  # here. The probe is measured against the window this very cut produced, so
+  # both sides start on the same frame by construction. --calibrate still cuts
+  # with parts:, because there the whole point is that separate runs line up.
+  while read -r start len <&3; do
+    [[ -n "$start" ]] || continue
+    rm -f "$psrc" "$penc"
+    ffmpeg -hide_banner -loglevel error -nostdin -y -ss "$start" -i "$src" \
+      -t "$len" -map 0:v:0 -an -sn -dn -map_chapters -1 -c:v copy \
+      -avoid_negative_ts make_zero "$psrc" >/dev/null 2>&1 || continue
+    [[ -s "$psrc" ]] || continue
+    # Check the cut is the length that was asked for. It is read over whatever
+    # the source is mounted on, and a short or partial read still produces a
+    # perfectly valid small MKV. Its byte ratio is then measured against a
+    # fragment and is meaningless, which is invisible once three windows are
+    # averaged into one confident-looking number.
+    local got
+    got="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$psrc" 2>/dev/null || echo 0)"
+    if ! python3 -c 'import sys
+g=float(sys.argv[1] or 0); w=float(sys.argv[2])
+sys.exit(0 if g >= w * 0.5 else 1)' "$got" "$len" 2>/dev/null; then
+      warn "probe window at ${start}s came back as ${got}s of a requested ${len}s.
+      Discarding it. If this keeps happening the source is not reading
+      reliably, and no prediction from it is worth having."
+      continue
+    fi
+    encode_video "$psrc" "$penc" >/dev/null 2>&1 || continue
+    local a b
+    a="$(filesize "$psrc")"; b="$(filesize "$penc")"
+    [[ "$a" -gt 0 && "$b" -gt 0 ]] || continue
+    # An encode that stops early is small and scores well: fewer bytes because
+    # fewer frames, and the psnr filter ends at the shorter input, so the
+    # frames that did encode look excellent. That reads as a spectacular saving
+    # and is the most dangerous thing a probe can report, because it argues for
+    # re-encoding the file. Compare the durations before believing the ratio.
+    local encdur
+    encdur="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$penc" 2>/dev/null || echo 0)"
+    if ! python3 -c 'import sys
+e=float(sys.argv[1] or 0); g=float(sys.argv[2] or 0)
+sys.exit(0 if g > 0 and e >= g * 0.95 else 1)' "$encdur" "$got" 2>/dev/null; then
+      warn "probe encode at ${start}s covered ${encdur}s of a ${got}s window, so it
+      stopped early. Discarding it: a short encode looks like a huge saving
+      and it is not one."
+      continue
+    fi
+    sa=$((sa + a)); sb=$((sb + b)); n=$((n + 1))
+    # The source is the reference here. Unlike ranking two encoders against
+    # each other, a shrink has exactly one thing it must not drift from, and
+    # this measures that drift directly.
+    # Pair frames by index, not by timestamp. A stream copy and a re-encode of
+    # the same frames disagree in the millisecond after rounding (0.041 against
+    # 0.042), and the psnr filter matches on PTS, so it compares frame N with
+    # frame N-1 and reports around 27 dB on content that is actually at 43.
+    # That reads exactly like a bad encode and would trip the PSNR floor on
+    # perfectly good files. setpts=N discards the timestamps and pairs on
+    # position, which is what a frame-to-frame comparison means.
+    local p s
+    p="$(ffmpeg -hide_banner -nostdin -i "$psrc" -i "$penc" -lavfi "[0:v]setpts=N[a];[1:v]setpts=N[b];[a][b]psnr" \
+      -f null - 2>&1 | grep -o 'average:[0-9.]*' | tail -1 | cut -d: -f2 || true)"
+    s="$(ffmpeg -hide_banner -nostdin -i "$psrc" -i "$penc" -lavfi "[0:v]setpts=N[a];[1:v]setpts=N[b];[a][b]ssim" \
+      -f null - 2>&1 | grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2 || true)"
+    [[ -n "$p" ]] && psnrs="$psnrs $p"
+    [[ -n "$s" ]] && ssims="$ssims $s"
+    # Name the file on every line. These print before the summary line, so
+    # across a library sweep an unlabelled window belongs to whichever file
+    # comes next, which is not something anyone should have to work out.
+    say "$(basename "$src") probe @${start}s ${got}s: $(python3 -c 'import sys;print("%.0fM -> %.0fM ratio %.4f"%(int(sys.argv[1])/1048576.0,int(sys.argv[2])/1048576.0,int(sys.argv[2])/int(sys.argv[1])))' "$a" "$b") PSNR ${p:-?}"
+  done 3< <(sample_points "$DURATION")
+
+  rm -f "$psrc" "$penc"
+  if [[ $n -eq 0 || $sa -le 0 ]]; then
+    warn "could not cut a sample from $(basename "$src"), so the saving cannot
+      be predicted. Encoding it anyway would be a guess, so it is skipped."
+    PE_RATIO=""; PE_PSNR=""; PE_SSIM=""; return 1
+  fi
+  PE_RATIO="$(python3 -c 'import sys;print("%.4f"%(int(sys.argv[2])/int(sys.argv[1])))' "$sa" "$sb")"
+  # Report the worst window, not the mean. A file that holds up for two samples
+  # and falls apart in the third is a file that falls apart.
+  PE_PSNR="$(python3 -c '
+import sys
+v=[float(x) for x in sys.argv[1].split()]
+print("%.4f"%min(v) if v else "")' "$psnrs")"
+  PE_SSIM="$(python3 -c '
+import sys
+v=[float(x) for x in sys.argv[1].split()]
+print("%.4f"%min(v) if v else "")' "$ssims")"
+  PE_PROBES="$n"
+  return 0
+}
+
+# ---------------------------- tags and chapters ------------------------------
+# Provenance goes into the file. Not ENCODER, which ffprobe overwrites with the
+# muxer's writing app by the time anything reads it back. Any MVC2SBS_ tags on
+# the source are carried across too: a 3D conversion that then gets shrunk
+# should not lose the record of how it was converted.
+read -r -d '' TAGMERGE_PY <<'TAGPY' || true
+import sys, xml.etree.ElementTree as ET
+
+src, dst, pairs = sys.argv[1], sys.argv[2], sys.argv[3:]
+root = None
+if src:
+    try:
+        t = ET.parse(src)
+        r = t.getroot()
+        if r.tag == "Tags":
+            root = r
+    except Exception:
+        root = None
+if root is None:
+    root = ET.Element("Tags")
+
+# Drop any earlier MKVSHRINK_ tags: the newest run is the one that describes
+# the file, and a stack of them is worse than none.
+for tag in list(root.findall("Tag")):
+    for simple in list(tag.findall("Simple")):
+        name = (simple.findtext("Name") or "")
+        if name.startswith("MKVSHRINK_"):
+            tag.remove(simple)
+    if not tag.findall("Simple"):
+        root.remove(tag)
+
+tag = ET.SubElement(root, "Tag")
+ET.SubElement(tag, "Targets")
+for i in range(0, len(pairs), 2):
+    s = ET.SubElement(tag, "Simple")
+    ET.SubElement(s, "Name").text = pairs[i]
+    ET.SubElement(s, "String").text = pairs[i + 1]
+ET.ElementTree(root).write(dst, encoding="utf-8", xml_declaration=True)
+TAGPY
+
+# sweep_progress INDEX TOTAL
+# A count and a wall-clock estimate for the run as a whole. Weighted by the
+# time files have actually taken rather than by file count, because a 56 GB
+# grain-heavy remux and a 6 GB anime film are not interchangeable units of
+# work and averaging them by count gives an ETA that is wrong all night.
+sweep_progress() {
+  local idx="$1" tot="$2"
+  [[ "$tot" -gt 1 ]] || return 0
+  local now elapsed
+  now=$(date +%s); elapsed=$(( now - SWEEP_T0 ))
+  local msg
+  msg="$(python3 -c '
+import sys
+idx, tot, elapsed = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
+done_bytes = float(sys.argv[4]); todo_bytes = float(sys.argv[5])
+if idx <= 0 or elapsed <= 0 or done_bytes <= 0:
+    print("%d/%d" % (idx, tot)); raise SystemExit
+rate = done_bytes / elapsed
+eta = todo_bytes / rate if rate > 0 else 0
+
+def hms(sec):
+    sec = int(max(0, sec))
+    h, m = sec // 3600, (sec % 3600) // 60
+    if h:
+        return "%dh%02dm" % (h, m)
+    if m:
+        return "%dm" % m
+    return "%ds" % sec
+
+if idx >= tot:
+    print("%d/%d done in %s" % (idx, tot, hms(elapsed)))
+else:
+    print("%d/%d done, about %s left" % (idx, tot, hms(eta)))
+' "$idx" "$tot" "$elapsed" "${SWEEP_BYTES_DONE:-0}" "${SWEEP_BYTES_TODO:-0}")"
+  say "Sweep: $msg"
+  mach "@@sweep index=$idx total=$tot elapsed=$elapsed done_bytes=${SWEEP_BYTES_DONE:-0} todo_bytes=${SWEEP_BYTES_TODO:-0}"
+}
+
+# ---------------------------- progress --------------------------------------
+# Reads ffmpeg's -progress key=value stream and turns it into one console line
+# and one machine line per update. Scraping the "frame=" status line was the
+# alternative; it is positional, changes between ffmpeg releases, and carries
+# no explicit end marker. -progress is the interface ffmpeg actually offers for
+# this, and a GUI can consume the machine lines without re-parsing prose.
+read -r -d '' PROGRESS_PY <<'PROGPY' || true
+import sys, time
+
+dur = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
+name = sys.argv[2] if len(sys.argv) > 2 else ""
+machine = (len(sys.argv) > 3 and sys.argv[3] == "1")
+start = time.time()
+cur = {}
+last_emit = 0.0
+
+def hms(sec):
+    sec = int(max(0, sec))
+    h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+    if h:
+        return "%dh%02dm" % (h, m)
+    if m:
+        return "%dm%02ds" % (m, s)
+    return "%ds" % s
+
+def emit(final=False):
+    # out_time_us is microseconds. Older builds only offer out_time_ms, which
+    # despite the name has also been microseconds for years; treat it as a
+    # fallback rather than trusting the unit in the key.
+    # Every one of these fields arrives as "N/A" in the first block, before
+    # the encoder has produced anything. One unguarded float() there kills the
+    # reader on line one and the rest of the stream goes to a dead pipe, which
+    # looks exactly like progress reporting that was never wired up.
+    def num(key, default=0.0):
+        v = cur.get(key, "")
+        try:
+            return float(str(v).strip().rstrip("x"))
+        except (TypeError, ValueError):
+            return default
+
+    t = 0.0
+    if cur.get("out_time_us", "N/A") != "N/A":
+        t = num("out_time_us") / 1e6
+    elif cur.get("out_time_ms", "N/A") != "N/A":
+        t = num("out_time_ms") / 1e6
+    spd = num("speed")
+    pct = (100.0 * t / dur) if dur > 0 else 0.0
+    pct = max(0.0, min(100.0, pct))
+    eta = ((dur - t) / spd) if (dur > 0 and spd > 0) else -1
+    elapsed = time.time() - start
+    fps = cur.get("fps", "0")
+    if fps == "N/A":
+        fps = "0"
+    if machine:
+        sys.stdout.write(
+            "@@progress file=%s pct=%.1f fps=%s speed=%.2f eta=%d elapsed=%d\n"
+            % (name, pct, fps, spd, eta if eta >= 0 else -1, elapsed))
+        sys.stdout.flush()
+    bar_w = 24
+    filled = int(bar_w * pct / 100.0)
+    bar = "#" * filled + "." * (bar_w - filled)
+    line = "  [%s] %5.1f%%  %s fps  %.2fx  ETA %s" % (
+        bar, pct, fps, spd, hms(eta) if eta >= 0 else "?")
+    sys.stderr.write("\r\033[K" + line)
+    if final:
+        sys.stderr.write("\r\033[K")
+    sys.stderr.flush()
+
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line or "=" not in line:
+        continue
+    k, v = line.split("=", 1)
+    cur[k] = v
+    if k == "progress":
+        now = time.time()
+        # ffmpeg emits a block roughly twice a second. Rendering every one of
+        # them is fine on a terminal and noise in a log, so throttle.
+        if v == "end":
+            emit(final=True)
+        elif now - last_emit >= 1.0:
+            last_emit = now
+            emit()
+PROGPY
+
+read -r -d '' CHAPSTRIP_PY <<'CHAPPY' || true
+import re, sys
+p = sys.argv[1]
+x = open(p, encoding="utf-8").read()
+open(p, "w", encoding="utf-8").write(
+    re.sub(r"\s*<ChapterTimeEnd>[^<]*</ChapterTimeEnd>", "", x))
+CHAPPY
+
+# ---------------------------- Cues check ------------------------------------
+read -r -d '' CUES_PY <<'CUESPY' || true
+import os, sys
+# 1C53BB6B is the Cues element. The SeekHead names it too, inside a SeekID
+# element, which on the wire is 53 AB 84 followed by those four bytes. A match
+# preceded by 53 AB 84 is only a reference to Cues, not Cues itself.
+CUES = b"\x1c\x53\xbb\x6b"
+REF = b"\x53\xab\x84" + CUES
+
+
+def scan(buf):
+    seen_ref = False
+    i = buf.find(CUES)
+    while i != -1:
+        if i >= 3 and buf[i - 3:i + 4] == REF:
+            seen_ref = True
+        else:
+            return True, seen_ref
+        i = buf.find(CUES, i + 1)
+    return False, seen_ref
+
+
+p = sys.argv[1]
+try:
+    size = os.path.getsize(p)
+    ref = False
+    with open(p, "rb") as fh:
+        present, r = scan(fh.read(16 << 20)); ref = ref or r
+        if not present and size > (16 << 20):
+            fh.seek(max(0, size - (16 << 20)))
+            present, r = scan(fh.read(16 << 20)); ref = ref or r
+    print("ok" if present else ("dangling" if ref else "missing"))
+except Exception:
+    print("unknown")
+CUESPY
+
+# ---------------------------- verification ----------------------------------
+# Exit status zero means FFmpeg and mkvmerge were happy. It does not mean the
+# file plays. Every one of these checks corresponds to a file that passed the
+# exit status and was still broken.
+# verify_output SRC OUT -> 0 pass, 1 fail. Sets V_NOTES.
+verify_output() {
+  local src="$1" out="$2" fail=0
+  V_NOTES=""
+  local sd od
+  sd="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$src" \
+        2>/dev/null | head -1 | tr -d '[:space:],')"
+  od="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$out" \
+        2>/dev/null | head -1 | tr -d '[:space:],')"
+  if [[ "$sd" =~ ^[0-9.]+$ && "$od" =~ ^[0-9.]+$ ]]; then
+    local verdict
+    verdict="$(python3 -c '
+import sys
+a, b = float(sys.argv[1]), float(sys.argv[2])
+d = b - a
+print("%.2f %.2f %+.2f %s" % (a, b, d, "ok" if abs(d) <= 1.0 else "drift"))
+' "$sd" "$od")"
+    read -r _s _o _d _v <<<"$verdict"
+    if [[ "$_v" != "ok" ]]; then
+      fail=1; V_NOTES="${V_NOTES}length drift ${_d}s; "
+      warn "Length check: source ${_s}s but output ${_o}s (${_d}s). The video is
+      not the same length as the source, so the audio will drift."
+    else
+      say "Length check: source ${_s}s, output ${_o}s (${_d}s)"
+    fi
+  else
+    fail=1; V_NOTES="${V_NOTES}length unreadable; "
+  fi
+
+  # Right length and still black for the first minute is a real failure mode,
+  # so decode the head of the file and count what comes out.
+  local frames
+  frames="$(ffmpeg -v error -stats -nostdin -i "$out" -map 0:v:0 -t 3 -f null - 2>&1 \
+    | tr '\r' '\n' | grep -o 'frame= *[0-9]*' | tail -1 | tr -dc '0-9' || true)"
+  frames="${frames:-0}"
+  if [[ "$frames" -lt 10 ]]; then
+    fail=1; V_NOTES="${V_NOTES}only $frames frames in the first 3s; "
+    warn "Playability check: only $frames frames decoded from the first three
+      seconds. Sound will play over a black picture."
+  else
+    say "Playability check: $frames frames from the first three seconds"
+  fi
+
+  local cues
+  cues="$(python3 -c "$CUES_PY" "$out" || true)"
+  case "${cues:-unknown}" in
+    ok|unknown) ;;
+    *) fail=1; V_NOTES="${V_NOTES}no Cues index; "
+       warn "Playability check: no Cues index, so the mux never finished." ;;
+  esac
+
+  local chap
+  chap="$(ffprobe -v error -show_chapters -show_entries format=duration -of json "$out" \
+    2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+ch = d.get("chapters", [])
+if not ch:
+    sys.exit(0)
+try:
+    dur = float(d["format"]["duration"])
+    last = max(float(c.get("end_time", 0)) for c in ch)
+except Exception:
+    sys.exit(0)
+print(("bad " if last > dur + 1 else "ok ") + "%d %.2f %.2f" % (len(ch), last, dur))
+' || true)"
+  read -r _cv _cn _cl _cd <<<"${chap:-}" || true
+  if [[ "${_cv:-}" == "bad" ]]; then
+    fail=1; V_NOTES="${V_NOTES}chapters end past the end of the file; "
+    warn "Chapter check: the last of ${_cn} chapters ends at ${_cl}s but the file
+      is only ${_cd}s long. Players that reject this show a black screen."
+  elif [[ "${_cv:-}" == "ok" ]]; then
+    say "Chapter check: ${_cn} chapters, last ends at ${_cl}s of ${_cd}s"
+  fi
+
+  # Silent until a player refuses the file, which is the worst kind of fault.
+  if [[ "${STEREO:-0}" != "0" ]]; then
+    local ost
+    ost="$(mkvmerge -J "$out" 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for t in d.get("tracks",[]):
+    if t.get("type")=="video":
+        p=t.get("properties",{})
+        print("%s %s" % (p.get("stereo_mode",0), p.get("display_dimensions","")))
+        break' || true)"
+    read -r _os _od <<<"${ost:-}" || true
+    if [[ "${_os:-0}" != "${STEREO}" || "${_od:-}" != "${DISP}" ]]; then
+      fail=1; V_NOTES="${V_NOTES}stereo/display not restored; "
+      warn "Stereo check: source was mode ${STEREO} at ${DISP}, output is
+      mode ${_os:-?} at ${_od:-?}. Jellyfin refuses files whose declared
+      display is smaller than the coded frame."
+    else
+      say "Stereo check: mode ${STEREO}, display ${DISP}"
+    fi
+  fi
+
+  return $fail
+}
+
+# ---------------------------- the actual work -------------------------------
+# shrink_one SRC ACTION AUDIO SUBS TRACKSRC
+# Echoes a path to the finished file that is guaranteed to sit on the same
+# filesystem as the destination, copying it there if it does not already.
+land_output() {
+  local o="$1" dst="$2" base="$3"
+  local devo devd
+  devo="$(stat -f%d "$(dirname "$o")" 2>/dev/null || stat -c%d "$(dirname "$o")" 2>/dev/null || echo x)"
+  devd="$(stat -f%d "$dst" 2>/dev/null || stat -c%d "$dst" 2>/dev/null || echo y)"
+  if [[ "$devo" == "$devd" ]]; then
+    echo "$o"; return 0
+  fi
+  local landed="${dst}/${base}.mkvshrink.landing.mkv"
+  cp "$o" "$landed" || { rm -f "$landed"; return 1; }
+  # A short copy is a valid MKV of the wrong length, and every check that
+  # mattered ran against the file on the scratch disk, not this one.
+  local a b
+  a="$(filesize "$o")"; b="$(filesize "$landed")"
+  if [[ "$a" != "$b" ]]; then
+    rm -f "$landed"; return 1
+  fi
+  rm -f "$o"
+  echo "$landed"
+}
+
+shrink_one() {
+  local src="$1" action="$2" akeep="$3" skeep="$4" tracksrc="$5"
+  local dir base work stage out
+  dir="$(cd "$(dirname "$src")" && pwd)"
+  base="$(basename "${src%.*}")"
+  work="${TMPROOT:-$dir}"
+  mkdir -p "$work"
+  stage="${work}/${base}.mkvshrink.stage.mkv"
+  out="${work}/${base}.mkvshrink.new.mkv"
+
+  local keepwork=0
+  cleanup_one() { [[ $keepwork -eq 1 ]] || rm -f "$stage" "$out" "${work}/${base}.chapters.xml" \
+                    "${work}/${base}.tags.xml" "${work}/${base}.srctags.xml" \
+                    "${dir}/${base}.mkvshrink.landing.mkv"; }
+
+  local t0; t0=$(date +%s)
+  local settings="tracks=$tracksrc"
+
+  if [[ "$action" == "shrink" ]]; then
+    say "Encoding $(basename "$src")"
+    mach "@@stage encode $src"
+    # DURATION comes from the probe, so the percentage and the ETA are against
+    # the real length of this file rather than an assumption.
+    PROGRESS_DUR="${DURATION:-0}"
+    PROGRESS_NAME="$(basename "$src")"
+    if ! encode_video "$src" "$stage"; then
+      PROGRESS_DUR=""; PROGRESS_NAME=""
+      warn "encode failed, leaving $(basename "$src") alone"
+      cleanup_one; return 1
+    fi
+    PROGRESS_DUR=""; PROGRESS_NAME=""
+    [[ $DRYRUN -eq 1 ]] && { cleanup_one; return 0; }
+    if [[ "$ENCODER" == "vt" ]]; then
+      settings="$settings vt q$VTQUALITY"
+    else
+      settings="$settings x265 crf$CRF $PRESET"
+    fi
+    [[ $TENBIT -eq 1 ]] && settings="$settings 10bit"
+  else
+    say "Remuxing $(basename "$src"), no re-encode"
+    mach "@@stage strip $src"
+    settings="$settings strip-only"
+  fi
+
+  # --- chapters ------------------------------------------------------------
+  # Extracted and stripped rather than copied, because a source that was itself
+  # written by FFmpeg carries a ChapterTimeEnd on every chapter. Matroska only
+  # defines that for ordered editions, and a player that reads it as one builds
+  # a broken virtual timeline: no picture until the first chapter boundary.
+  local chapxml="${work}/${base}.chapters.xml"
+  local -a chapargs=()
+  if mkvextract "$src" chapters > "$chapxml" 2>/dev/null && [[ -s "$chapxml" ]]; then
+    python3 -c "$CHAPSTRIP_PY" "$chapxml"
+    chapargs=(--chapters "$chapxml")
+  else
+    rm -f "$chapxml"
+    chapargs=(--no-chapters)
+  fi
+
+  # --- tags ----------------------------------------------------------------
+  local srctags="${work}/${base}.srctags.xml" tagxml="${work}/${base}.tags.xml"
+  mkvextract "$src" tags > "$srctags" 2>/dev/null || : > "$srctags"
+  [[ -s "$srctags" ]] || srctags=""
+  python3 -c "$TAGMERGE_PY" "$srctags" "$tagxml" \
+    MKVSHRINK_VERSION "$VERSION build $BUILD" \
+    MKVSHRINK_SETTINGS "$settings" \
+    MKVSHRINK_SOURCE_SIZE "$(filesize "$src")"
+
+  # --- mux -----------------------------------------------------------------
+  # mkvmerge writes the file you keep. FFmpeg's output and MKVToolNix's contain
+  # identical streams and agree on every field mkvdiff checks, and Jellyfin's
+  # Android TV client on an Nvidia Shield still refuses to direct play FFmpeg's
+  # and plays MKVToolNix's.
+  #
+  # Audio and subtitles come straight from the source here rather than through
+  # the encode, so they are never touched by FFmpeg at all and keep their
+  # languages, names and flags without anything having to restore them.
+  local -a mkv=(mkvmerge -q -o "$out")
+  local vsrc="$src"
+  if [[ "$action" == "shrink" ]]; then
+    mkv+=(--no-chapters --no-global-tags --no-track-tags)
+    [[ -n "${VID_LANG:-}" ]] && mkv+=(--language "0:${VID_LANG}")
+    [[ -n "${VID_NAME:-}" ]] && mkv+=(--track-name "0:${VID_NAME}")
+    mkv+=(--default-track-flag 0:1 "$stage")
+    mkv+=(--no-video)
+  fi
+  mkv+=(--no-chapters --no-global-tags)
+  # If the track that carried the default flag is one of the ones being
+  # dropped, the output ends up with no default track at all and players pick
+  # arbitrarily. This has to be decided against the list actually being kept,
+  # which may have been edited by hand, not against what the rules proposed.
+  local fix
+  if [[ -n "$akeep" && "$akeep" != "none" ]]; then
+    mkv+=(--audio-tracks "$akeep")
+    while IFS= read -r fix; do
+      [[ -n "$fix" ]] && mkv+=(--default-track-flag "$fix")
+    done <<< "$(default_flag_args "$akeep" "${AUDIO_DEFAULT_ID:-}")"
+  else
+    mkv+=(--no-audio)
+  fi
+  if [[ -n "$skeep" && "$skeep" != "none" ]]; then
+    mkv+=(--subtitle-tracks "$skeep")
+    while IFS= read -r fix; do
+      [[ -n "$fix" ]] && mkv+=(--default-track-flag "$fix")
+    done <<< "$(default_flag_args "$skeep" "${SUBS_DEFAULT_ID:-}")"
+  else
+    mkv+=(--no-subtitles)
+  fi
+  mkv+=("$vsrc")
+  mkv+=("${chapargs[@]}")
+  mkv+=(--global-tags "$tagxml")
+
+  if [[ $DRYRUN -eq 1 ]]; then
+    printf '%q ' "${mkv[@]}"; echo
+    cleanup_one; return 0
+  fi
+
+  if ! "${mkv[@]}"; then
+    warn "mkvmerge failed on $(basename "$src"). The original is untouched."
+    cleanup_one; return 1
+  fi
+  rm -f "$stage"
+
+  # --- stereo mode and display dimensions ----------------------------------
+  # A Full-SBS file must declare 3840x2160, not the per-eye 1920x1080 a plain
+  # reading of the spec suggests. Both express 16:9; Jellyfin refuses the file
+  # whose declared display is smaller than its coded frame.
+  if [[ "${STEREO:-0}" != "0" || -n "${DISP:-}" ]]; then
+    local -a pe=(mkvpropedit "$out" --edit track:v1)
+    [[ "${STEREO:-0}" != "0" ]] && pe+=(--set "stereo-mode=${STEREO}")
+    if [[ -n "${DISP:-}" ]]; then
+      pe+=(--set "display-width=${DISP%%x*}" --set "display-height=${DISP##*x}")
+    fi
+    "${pe[@]}" >/dev/null || warn "could not restore stereo mode on $(basename "$out")"
+  fi
+
+  # --- verify --------------------------------------------------------------
+  mach "@@stage verify $src"
+  if ! verify_output "$src" "$out"; then
+    keepwork=1
+    warn "$(basename "$src") failed verification: ${V_NOTES}
+      The original is untouched. The failed output is at:
+        $out"
+    mach "@@failed $src"
+    return 1
+  fi
+
+  if [[ $VERIFY_FULL -eq 1 && "$action" == "shrink" ]]; then
+    say "Measuring PSNR over the whole file"
+    local fp
+    fp="$(ffmpeg -hide_banner -nostdin -i "$src" -i "$out" -lavfi "[0:v]setpts=N[a];[1:v]setpts=N[b];[a][b]psnr" -f null - 2>&1 \
+      | grep -o 'average:[0-9.]*' | tail -1 | cut -d: -f2 || true)"
+    if [[ -n "$fp" ]] && ! python3 -c 'import sys;sys.exit(0 if float(sys.argv[1])>=float(sys.argv[2]) else 1)' \
+         "$fp" "$MINPSNR"; then
+      keepwork=1
+      warn "Full-file PSNR ${fp} dB is below the ${MINPSNR} dB floor. Rejected.
+      The original is untouched. The output is at: $out"
+      return 1
+    fi
+    say "Full-file PSNR: ${fp} dB"
+  fi
+
+  # --- replace -------------------------------------------------------------
+  local newsize oldsize
+  newsize="$(filesize "$out")"; oldsize="$(filesize "$src")"
+  local saved
+  saved="$(python3 -c 'import sys
+o,n=int(sys.argv[1]),int(sys.argv[2])
+print("%.1f" % (100.0*(o-n)/o) if o else "0.0")' "$oldsize" "$newsize")"
+
+  # Get the finished file onto the destination filesystem before anything is
+  # renamed. With --temp pointing at a scratch disk, "mv" from there to the NAS
+  # is a copy rather than a rename, so it is neither atomic nor instant. In
+  # folder mode the original has already been moved aside by then, and an
+  # interrupted copy would leave a partial file and no original in place. Copy
+  # first, check it arrived whole, and only then start moving things around.
+  if ! out="$(land_output "$out" "$dir" "$base")"; then
+    warn "could not copy the finished file to $dir, leaving everything alone"
+    keepwork=1; return 1
+  fi
+
+  case "$REPLACE" in
+    none)
+      local keepat="${dir}/${base}.shrunk.mkv"
+      mv -f "$out" "$keepat"
+      say "Wrote $(basename "$keepat"), saving ${saved}%. Original untouched."
+      mach "@@done $keepat $saved"
+      ;;
+    folder)
+      local rdir
+      if [[ -n "$REPLACEDIR" ]]; then
+        rdir="${REPLACEDIR}${dir}"
+      else
+        rdir="${dir}/_replaced"
+      fi
+      mkdir -p "$rdir"
+      # Move the original out first, then the new file in. The reverse order
+      # has a moment where the only copy of the film is the one that has just
+      # been written, and that is the moment the disk fills up.
+      if ! mv -f "$src" "${rdir}/$(basename "$src")"; then
+        warn "could not move the original aside, leaving everything alone"
+        keepwork=1; return 1
+      fi
+      mv -f "$out" "${dir}/$(basename "${src%.*}").mkv"
+      say "Replaced $(basename "$src"), saving ${saved}%. Original in $(basename "$rdir")/"
+      mach "@@done $src $saved"
+      ;;
+    insitu)
+      # Rename over the top rather than truncate and rewrite: a rename is
+      # atomic on the same filesystem, so an interruption leaves one whole file
+      # rather than half of one.
+      mv -f "$out" "${dir}/$(basename "${src%.*}").mkv"
+      [[ "${src##*.}" == "mkv" ]] || rm -f "$src"
+      say "Replaced $(basename "$src") in place, saving ${saved}%"
+      mach "@@done $src $saved"
+      ;;
+  esac
+
+  local el=$(( $(date +%s) - t0 ))
+  say "Finished in $((el/60))m $((el%60))s"
+  cleanup_one
+  return 0
+}
+
+# ---------------------------- file discovery --------------------------------
+collect_inputs() {
+  local p
+  FILES=()
+  for p in "$@"; do
+    # Resolve to an absolute path here, at the one point every input passes
+    # through. A plan written from a relative argument records relative paths,
+    # and --apply run from anywhere else then reports every row as missing.
+    # No realpath: it is not on a stock macOS.
+    p="$(abspath "$p")"
+    if [[ -f "$p" ]]; then
+      FILES+=("$p")
+    elif [[ -d "$p" ]]; then
+      local -a found=()
+      if [[ $RECURSE -eq 1 ]]; then
+        while IFS= read -r -d '' f; do found+=("$f"); done \
+          < <(find "$p" -type f -name '*.mkv' -not -path '*/_replaced/*' -print0 | sort -z)
+      else
+        while IFS= read -r -d '' f; do found+=("$f"); done \
+          < <(find "$p" -maxdepth 1 -type f -name '*.mkv' -print0 | sort -z)
+      fi
+      FILES+=(${found[@]+"${found[@]}"})
+    else
+      warn "no such file or folder: $p"
+    fi
+  done
+}
+
+# ---------------------------- plan ------------------------------------------
+# The reason column carries the skip reason, and any audio language that lost
+# every track. Both are things you want to see before an unattended sweep, and
+# neither is visible in the ID columns.
+plan_reason() {
+  local r=""
+  [[ -n "${D_REASON:-}" ]] && r="$D_REASON"
+  if [[ -n "${AUDIO_LOST_LANGS:-}" ]]; then
+    [[ -n "$r" ]] && r="$r,"
+    r="${r}drops-audio:${AUDIO_LOST_LANGS}"
+  fi
+  echo "${r:--}"
+}
+
+plan_row() {  # emits one TSV row for the current probe state
+  # Reason last, so sorting by an existing column still works and a path
+  # containing anything odd cannot shift it. A skip row without a reason is
+  # useless: "too small to bother with" and "re-encoding would make it bigger"
+  # sort identically at 0.0% and want completely different responses.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$D_ACTION" "${PLAN_AUDIO}" "${PLAN_SUBS}" "${PLAN_SAVE}" \
+    "${PE_PSNR:--}" "${PLAN_SIZE}" "${PLAN_PRED}" "${SEGUID:-}" "$1" "$(plan_reason)"
+}
+
+# analyse FILE -> fills D_ACTION, PLAN_*
+analyse() {
+  local f="$1"
+  probe_file "$f"
+  if [[ "$P_OK" != "1" ]]; then
+    D_ACTION="skip"; D_REASON="${P_ERR:-unreadable}"
+    PLAN_AUDIO="-"; PLAN_SUBS="-"; PLAN_SAVE="0"; PLAN_SIZE="0"; PLAN_PRED="0"
+    return 0
+  fi
+  [[ -n "${WARNINGS:-}" ]] && warn "$(basename "$f"): $WARNINGS"
+  # Loud, because it is the one selection mistake you cannot see in the plan's
+  # ID columns and cannot undo once the original is gone.
+  if [[ -n "${AUDIO_LOST_LANGS:-}" ]]; then
+    warn "$(basename "$f"): dropping every audio track in: ${AUDIO_LOST_LANGS}.
+      Keeping: ${AUDIO_KEEP_LANGS:-none}. If one of those is the original
+      language of this film, add it: --audio-langs ${AUDIOLANGS},${AUDIO_LOST_LANGS%%,*}"
+  fi
+  [[ "${ALIGNED:-1}" == "1" ]] || warn "$(basename "$f"): mkvmerge and ffprobe
+      disagree on the track order, so per-track sizes are not available. Video
+      size falls back to the file minus the tracks it could identify, and the
+      saving from dropping tracks cannot be counted. The encode prediction is
+      still sound; the strip saving will read low."
+  decide
+
+  PLAN_AUDIO="${AUDIO_KEEP:-}"; [[ -n "$PLAN_AUDIO" ]] || PLAN_AUDIO="none"
+  PLAN_SUBS="${SUBS_KEEP:-}";   [[ -n "$PLAN_SUBS" ]]  || PLAN_SUBS="none"
+  PLAN_SIZE="$(python3 -c 'import sys;print("%.0f"%(int(sys.argv[1])/1048576))' "${TOTAL_BYTES:-0}")"
+  PLAN_PRED="$PLAN_SIZE"; PLAN_SAVE="0.0"
+
+  if [[ "$D_ACTION" == "skip" ]]; then
+    say "$(basename "$f"): skipped, $D_REASON"
+    return 0
+  fi
+
+  if [[ "$D_ACTION" == "shrink" ]]; then
+    local work="${TMPROOT:-$(dirname "$f")}"
+    mkdir -p "$work"
+    if probe_encode "$f" "$work" && [[ -n "${PE_RATIO:-}" ]]; then
+      read -r PLAN_PRED PLAN_SAVE <<<"$(python3 -c '
+import sys
+vid, other, total, ratio = (int(sys.argv[1]), int(sys.argv[2]),
+                            int(sys.argv[3]), float(sys.argv[4]))
+if not total:
+    print("0 0.0"); raise SystemExit
+drop = int(sys.argv[5])
+# The video estimate comes from a track statistics tag when the file carries
+# one and from bitrate times duration when it does not. The fallback is a
+# guess, and on a file whose reported bitrate does not match its actual
+# content it can exceed the size of the whole file. That drives the
+# prediction to nonsense like -212%, which then argues loudly for or against
+# re-encoding on the strength of a number that was never possible. The video
+# cannot be larger than the file minus the other tracks, so say so.
+room = max(0, total - other - drop)
+if vid > room:
+    vid = room
+# The other direction, and the one that silently rejected good files. When
+# mkvmerge and ffprobe disagree on track order the per-track sizes are
+# abandoned and this arrives as zero. The prediction then reads
+# 0 * ratio + other + overhead, overhead swells to cover the whole file, and
+# the answer is "saves 0.0%" for a file that would have halved. It skipped
+# Akira at ratio 0.48. Video is nearly all of a video file, so when there is
+# no per-track figure, treat everything that is not a known track as video.
+if vid <= 0:
+    vid = room
+# Container and index overhead is small but real, so account for what is not
+# a track rather than assume video plus tracks equals the file.
+overhead = max(0, total - vid - other - drop)
+pred = int(vid * ratio) + other + overhead
+print("%d %.1f" % (pred / 1048576, 100.0 * (total - pred) / total))
+' "${VID_BYTES:-0}" "${KEEP_OTHER_BYTES:-0}" "${TOTAL_BYTES:-0}" "$PE_RATIO" "${DROP_BYTES:-0}")"
+      # The window count belongs in this line. PE_PSNR is the worst of the
+      # windows, so a prediction drawn from one surviving window is a much
+      # weaker claim than the same numbers drawn from three, and nothing else
+      # in the output would tell you which you were looking at.
+      say "$(basename "$f"): probe ratio ${PE_RATIO}, PSNR ${PE_PSNR:-?} dB, SSIM ${PE_SSIM:-?}, predicted saving ${PLAN_SAVE}% (from ${PE_PROBES:-?} probe window(s))"
+      # A quality floor is worth more than a size floor. An encode that passes
+      # every structural check and still looks like mush is the failure the
+      # exit status cannot see.
+      if [[ -n "${PE_PSNR:-}" ]] && ! python3 -c \
+        'import sys;sys.exit(0 if float(sys.argv[1])>=float(sys.argv[2]) else 1)' \
+        "$PE_PSNR" "$MINPSNR"; then
+        warn "$(basename "$f"): probe PSNR ${PE_PSNR} dB is below the ${MINPSNR} dB
+      floor, so it is not re-encoded. Either the source is already tightly
+      encoded or the settings are wrong for this kind of content. Run
+      --calibrate on it before overriding."
+        D_ACTION="strip"; D_REASON="below-psnr-floor"
+      else
+        # Compare the encode against the remux, not against doing nothing.
+        # Dropping tracks is lossless, takes a minute, and is available whether
+        # or not the video is touched. So the question a re-encode has to
+        # answer is what it adds on top of that, and on a grain-heavy title
+        # that can be a few points for hours of work on a 56 GB file. Judging
+        # it on total saving credits the encode with bytes the remux was going
+        # to reclaim anyway.
+        STRIP_SAVE="$(python3 -c '
+import sys
+d=int(sys.argv[1]); t=int(sys.argv[2])
+print("%.1f" % (100.0*d/t) if t else "0.0")' "$DROP_BYTES" "$TOTAL_BYTES")"
+        ENC_GAIN="$(python3 -c '
+import sys
+print("%.1f" % (float(sys.argv[1]) - float(sys.argv[2])))' "$PLAN_SAVE" "$STRIP_SAVE")"
+        if ! python3 -c 'import sys;sys.exit(0 if float(sys.argv[1])>=float(sys.argv[2]) else 1)' \
+             "$ENC_GAIN" "$MINSAVING"; then
+          say "$(basename "$f"): re-encoding adds ${ENC_GAIN}% over the ${STRIP_SAVE}% the
+      remux gets for free, which is under ${MINSAVING}%. Not re-encoding."
+          D_ACTION="strip"; D_REASON="marginal-over-remux"
+        fi
+      fi
+    else
+      warn "$(basename "$f"): could not probe, skipping"
+      D_ACTION="skip"; D_REASON="probe-failed"
+      return 0
+    fi
+  fi
+
+  # Track dropping is a remux. It costs seconds and often saves more than the
+  # re-encode does, so it must not be gated behind the encode decision: a file
+  # that is already HEVC can still be carrying half a gigabyte of Spanish DTS.
+  if [[ "$D_ACTION" == "strip" ]]; then
+    if strip_worth_it; then
+      PLAN_PRED="$(python3 -c 'import sys;print("%.0f"%((int(sys.argv[1])-int(sys.argv[2]))/1048576))' \
+        "${TOTAL_BYTES:-0}" "${DROP_BYTES:-0}")"
+      PLAN_SAVE="$(python3 -c 'import sys;print("%.1f"%(100.0*int(sys.argv[2])/int(sys.argv[1])))' \
+        "${TOTAL_BYTES:-1}" "${DROP_BYTES:-0}")"
+      say "$(basename "$f"): remux only ($D_REASON), dropping tracks saves ${PLAN_SAVE}%"
+    else
+      D_ACTION="skip"
+      say "$(basename "$f"): nothing worth doing ($D_REASON)"
+    fi
+  fi
+  return 0
+}
+
+# ---------------------------- interactive -----------------------------------
+confirm_tracks() {  # $1 = file
+  [[ -t 0 ]] || return 0
+  printf '\n%s\n' "$(basename "$1")" >&2
+  cat "$P_TABLE" >&2
+  printf '\nkeep audio [%s] subs [%s]\n' "$PLAN_AUDIO" "$PLAN_SUBS" >&2
+  local a s
+  read -r -p "audio IDs (enter to accept, 'all', 'none'): " a </dev/tty || true
+  read -r -p "subtitle IDs: " s </dev/tty || true
+  [[ -n "$a" ]] && PLAN_AUDIO="$a"
+  [[ -n "$s" ]] && PLAN_SUBS="$s"
+  [[ "$PLAN_AUDIO" == "all" ]] && PLAN_AUDIO="${AUDIO_ALL}"
+  [[ "$PLAN_SUBS" == "all" ]] && PLAN_SUBS="${SUBS_ALL}"
+  return 0
+}
+
+# ---------------------------- calibrate -------------------------------------
+do_calibrate() {
+  local f="$1"
+  [[ -f "$f" ]] || die "no such file: $f"
+  probe_file "$f"
+  [[ "$P_OK" == "1" ]] || die "${P_ERR:-could not read $f}"
+  local work="${TMPROOT:-$(dirname "$f")}"
+  mkdir -p "$work"
+  local at="$CALIBRATE_AT"
+  if [[ -z "$at" ]]; then
+    at="$(python3 -c '
+import sys
+t = float(sys.argv[1]) * 0.40
+h = int(t // 3600); m = int((t % 3600) // 60); s = t - h * 3600 - m * 60
+print("%02d:%02d:%06.3f" % (h, m, s))' "$DURATION")"
+  fi
+  local endt
+  endt="$(python3 -c '
+import sys
+def sec(x):
+    p = [float(y) for y in x.split(":")]
+    while len(p) < 3: p.insert(0, 0.0)
+    return p[0]*3600 + p[1]*60 + p[2]
+t = sec(sys.argv[1]) + float(sys.argv[2])
+h = int(t // 3600); m = int((t % 3600) // 60); s = t - h*3600 - m*60
+print("%02d:%02d:%06.3f" % (h, m, s))' "$at" "$CALIBRATE_LEN")"
+
+  # Banding and crushed blacks live in dark scenes, and the midpoint of a film
+  # is usually not one. Sample the luma average at intervals and take the
+  # darkest, so the clip is cut where the encoder is most likely to fail.
+  if [[ -z "$CALIBRATE_AT" && $DARKEST -eq 1 ]]; then
+    say "Looking for the darkest point in the film"
+    local darkat
+    darkat="$(find_darkest "$f")"
+    if [[ -n "$darkat" ]]; then
+      at="$(python3 -c '
+import sys
+t = float(sys.argv[1])
+h, m = int(t // 3600), int((t % 3600) // 60)
+print("%02d:%02d:%06.3f" % (h, m, t - h * 3600 - m * 60))' "$darkat")"
+      endt="$(python3 -c '
+import sys
+t = float(sys.argv[1]) + float(sys.argv[2])
+h, m = int(t // 3600), int((t % 3600) // 60)
+print("%02d:%02d:%06.3f" % (h, m, t - h * 3600 - m * 60))' "$darkat" "$CALIBRATE_LEN")"
+    fi
+  fi
+
+  local clip="$work/calib.src.mkv"
+  # Cut once, and encode that. A seek option on the full source snaps to a
+  # keyframe, so two runs can start on different frames and still produce a
+  # confident looking PSNR.
+  say "Cutting a ${CALIBRATE_LEN}s clip at $at"
+  mkvmerge -q -o "$clip" --no-audio --no-subtitles --no-chapters \
+    --no-global-tags --no-track-tags --split "parts:${at}-${endt}" "$f" >/dev/null
+  [[ -s "$clip" ]] || die "could not cut a clip from $f"
+
+  local srcsize; srcsize="$(filesize "$clip")"
+  printf '\n%s\n' "  Source clip: $(python3 -c 'import sys;print("%.1f MB"%(int(sys.argv[1])/1048576))' "$srcsize"), ${VID_W}x${VID_H}, ${VID_PIX:-?}, ${VID_CODEC}"
+  printf '  %s\n\n' "Each row is measured against that clip, which is the only thing a shrink must not drift from."
+  printf '  %-26s %10s %8s %9s %8s %8s\n' "encode" "size" "of src" "PSNR" "SSIM" "time"
+
+  local saveenc="$ENCODER" saveq="$VTQUALITY" savecrf="$CRF"
+  local spec
+  for spec in "vt:55" "vt:62" "vt:65" "vt:70" "x265:20" "x265:18"; do
+    local kind="${spec%%:*}" val="${spec##*:}"
+    ENCODER="$kind"
+    [[ "$kind" == "vt" ]] && VTQUALITY="$val" || CRF="$val"
+    local dst="$work/calib.${kind}${val}.mkv"
+    local t0; t0=$(date +%s)
+    if ! encode_video "$clip" "$dst" >/dev/null 2>&1; then
+      printf '  %-26s %10s\n' "$kind $val" "failed"
+      continue
+    fi
+    local el=$(( $(date +%s) - t0 ))
+    local sz psnr ssim
+    sz="$(filesize "$dst")"
+    psnr="$(ffmpeg -hide_banner -nostdin -i "$clip" -i "$dst" -lavfi "[0:v]setpts=N[a];[1:v]setpts=N[b];[a][b]psnr" -f null - 2>&1 \
+      | grep -o 'average:[0-9.]*' | tail -1 | cut -d: -f2 || true)"
+    ssim="$(ffmpeg -hide_banner -nostdin -i "$clip" -i "$dst" -lavfi "[0:v]setpts=N[a];[1:v]setpts=N[b];[a][b]ssim" -f null - 2>&1 \
+      | grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2 || true)"
+    printf '  %-26s %9.1fM %7.0f%% %8s %8s %5dm%02ds\n' \
+      "$kind $val $([[ $TENBIT -eq 1 ]] && echo 10-bit || echo 8-bit)" \
+      "$(python3 -c 'import sys;print(int(sys.argv[1])/1048576)' "$sz")" \
+      "$(python3 -c 'import sys;print(100.0*int(sys.argv[1])/int(sys.argv[2]))' "$sz" "$srcsize")" \
+      "${psnr:-?}" "${ssim:-?}" "$((el/60))" "$((el%60))"
+    [[ $KEEPCLIPS -eq 1 ]] || rm -f "$dst"
+  done
+  ENCODER="$saveenc"; VTQUALITY="$saveq"; CRF="$savecrf"
+  if [[ $KEEPCLIPS -eq 1 ]]; then
+    say "Clips kept in $work"
+    say "Compare them by eye. PSNR and SSIM rank these rows, but neither sees
+      banding or crushed blacks: the error is small in magnitude and spread
+      across a large flat area, which is exactly what those metrics average
+      away. A row can win the table and still look wrong on a dark scene."
+  else
+    rm -f "$clip"
+  fi
+
+  cat >&2 <<'EOF'
+
+  Reading this: pick the cheapest row whose PSNR you are happy with, then set
+  --min-psnr a little below it. Note that this source has already been through
+  one lossy encode, so the numbers are second generation and will sit lower
+  than anything measured from a near-lossless master. That is expected. What
+  matters is where the curve flattens: above that point you are spending bits
+  preserving the previous encoder's artefacts.
+EOF
+}
+
+# Echoes the start time, in seconds, of the darkest sampled point. Uses
+# signalstats on one frame per sample so it costs a seek and a decode rather
+# than a pass over the film.
+find_darkest() {
+  local f="$1" dur="${DURATION:-0}" i pts best="" bestval=""
+  [[ "${dur%.*}" -gt 120 ]] || { echo ""; return 0; }
+  for i in 10 18 26 34 42 50 58 66 74 82 90; do
+    pts="$(python3 -c 'import sys;print("%.3f" % (float(sys.argv[1]) * int(sys.argv[2]) / 100.0))' "$dur" "$i")"
+    local y
+    y="$(ffmpeg -hide_banner -nostdin -ss "$pts" -i "$f" -frames:v 1 \
+         -vf signalstats,metadata=print:key=lavfi.signalstats.YAVG \
+         -f null - 2>&1 | grep -o 'YAVG=[0-9.]*' | tail -1 | cut -d= -f2 || true)"
+    [[ -n "$y" ]] || continue
+    if [[ -z "$bestval" ]] || python3 -c 'import sys;sys.exit(0 if float(sys.argv[1])<float(sys.argv[2]) else 1)' "$y" "$bestval"; then
+      bestval="$y"; best="$pts"
+    fi
+  done
+  echo "$best"
+}
+
+# ---------------------------- plan file -------------------------------------
+write_plan() {
+  local out="$1"; shift
+  collect_inputs "$@"
+  [[ ${#FILES[@]} -gt 0 ]] || die "nothing to do"
+  banner "${#FILES[@]} file(s) to plan"
+  say "Planning ${#FILES[@]} file(s). This probes and test-encodes each one."
+  {
+    printf '# mkvshrink %s build %s plan, %s\n' "$VERSION" "$BUILD" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf '# settings: %s\n' "$(plan_settings_line)"
+    printf '#\n'
+    printf '# Edit the action, audio and subs columns. Delete rows you do not want.\n'
+    printf '# action: shrink | strip | skip\n'
+    printf '# audio/subs: comma separated mkvmerge track IDs, or all, or none\n'
+    printf '# Sort by save%% to find the rows the rules got wrong: they cluster.\n'
+    printf '#\n'
+    printf '#action\taudio\tsubs\tsave%%\tpsnr\tsize_mb\tpred_mb\tuid\tpath\treason\n'
+  } > "$out"
+  local f
+  for f in "${FILES[@]}"; do
+    analyse "$f"
+    plan_row "$f" >> "$out"
+  done
+  say "Wrote $out"
+  say "Read it, fix what needs fixing, then: mkvshrink --apply $out"
+}
+
+banner() {
+  say "mkvshrink $VERSION build $BUILD${1:+, $1}, $(plan_settings_line)"
+}
+
+plan_settings_line() {
+  local s
+  if [[ "$ENCODER" == "vt" ]]; then s="vt q$VTQUALITY"; else s="x265 crf$CRF $PRESET"; fi
+  [[ $TENBIT -eq 1 ]] && s="$s 10bit"
+  echo "$s min-saving=${MINSAVING}% min-psnr=${MINPSNR}dB min-size=$(human_size "$MINSIZE") audio=$AUDIOLANGS subs=$SUBLANGS replace=$REPLACE"
+}
+
+apply_plan() {
+  local plan="$1"
+  [[ -f "$plan" ]] || die "no such plan: $plan"
+  banner "applying $(basename "$plan")"
+  # The plan records the build that wrote it. If that is not this build, say
+  # so: the rules and the arithmetic have both changed between builds, and a
+  # plan generated under different logic is worth re-checking.
+  local planbuild
+  planbuild="$(sed -n 's/^# mkvshrink \([^ ]*\) build \([^ ]*\) plan.*/\1 build \2/p' "$plan" | head -1)"
+  if [[ -n "$planbuild" && "$planbuild" != "$VERSION build $BUILD" ]]; then
+    warn "this plan was written by mkvshrink $planbuild and you are running
+      $VERSION build $BUILD. Predictions and track rules may have changed.
+      Re-run --plan if the numbers matter."
+  fi
+  local n=0 done=0 failed=0 skipped=0
+  local action akeep skeep save psnr size pred uid path reason
+  # save, size, pred and reason are read for their column position only. The file is
+  # re-probed here rather than trusted, because the plan may be old.
+  # shellcheck disable=SC2034
+  while IFS=$'\t' read -r action akeep skeep save psnr size pred uid path reason; do
+    [[ -z "$action" || "$action" == \#* ]] && continue
+    n=$((n + 1))
+    [[ "$action" == "skip" ]] && { skipped=$((skipped + 1)); continue; }
+    if [[ ! -f "$path" ]]; then
+      warn "gone since the plan was written: $path"
+      failed=$((failed + 1)); continue
+    fi
+    probe_file "$path"
+    if [[ "$P_OK" != "1" ]]; then
+      warn "cannot read $path: ${P_ERR:-}"; failed=$((failed + 1)); continue
+    fi
+    # A plan goes stale the moment anything else touches the library, and track
+    # IDs shift once a file has been processed. Applying a stale row keeps the
+    # wrong tracks and says nothing about it, so the file has to prove it is
+    # still the file the plan was written about. Path alone does not.
+    if [[ -n "$uid" && -n "${SEGUID:-}" && "$uid" != "$SEGUID" ]]; then
+      warn "$path has changed since the plan was written, so it is left alone.
+      Re-run --plan for it."
+      failed=$((failed + 1)); continue
+    fi
+    [[ "$akeep" == "all" ]] && akeep="${AUDIO_ALL}"
+    [[ "$skeep" == "all" ]] && skeep="${SUBS_ALL}"
+    [[ "$akeep" == "-" ]] && akeep="${AUDIO_KEEP}"
+    [[ "$skeep" == "-" ]] && skeep="${SUBS_KEEP}"
+    # Provenance that is worth having: six months from now, a file with one
+    # audio track and no obvious reason for it should say whether that was the
+    # rules or a decision somebody made.
+    local tracksrc="rules"
+    [[ "$akeep" == "${AUDIO_KEEP}" && "$skeep" == "${SUBS_KEEP}" ]] || tracksrc="manual"
+    if shrink_one "$path" "$action" "$akeep" "$skeep" "$tracksrc"; then
+      done=$((done + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done < "$plan"
+  say "Plan finished: $done done, $skipped skipped, $failed failed, of $n rows"
+}
+
+# ---------------------------- main ------------------------------------------
+if [[ -n "$CALIBRATE" ]]; then
+  do_calibrate "$CALIBRATE"
+  exit 0
+fi
+
+if [[ -n "$APPLYIN" ]]; then
+  apply_plan "$APPLYIN"
+  exit 0
+fi
+
+if [[ -n "$PLANOUT" ]]; then
+  [[ ${#INPUTS[@]} -gt 0 ]] || { usage >&2; die "no input files or folders given"; }
+  write_plan "$PLANOUT" "${INPUTS[@]}"
+  exit 0
+fi
+
+[[ ${#INPUTS[@]} -gt 0 ]] || { usage >&2; die "no input files or folders given"; }
+collect_inputs "${INPUTS[@]}"
+[[ ${#FILES[@]} -gt 0 ]] || die "nothing to do"
+
+banner "${#FILES[@]} file(s)"
+if [[ ${#FILES[@]} -gt 8 && -z "$PLANOUT" && $INTERACTIVE -eq 0 ]]; then
+  say "That is a sweep. Consider --plan so you can read the decisions before
+      committing hours to them."
+fi
+
+TOTAL_DONE=0; TOTAL_FAILED=0; TOTAL_SKIPPED=0
+SWEEP_T0=$(date +%s)
+SWEEP_BYTES_DONE=0
+SWEEP_BYTES_TODO=0
+for _f in "${FILES[@]}"; do
+  SWEEP_BYTES_TODO=$(( SWEEP_BYTES_TODO + $(filesize "$_f") ))
+done
+SWEEP_INDEX=0
+
+for f in "${FILES[@]}"; do
+  SWEEP_INDEX=$(( SWEEP_INDEX + 1 ))
+  analyse "$f"
+  if [[ -n "$ATRACKS" ]]; then
+    PLAN_AUDIO="$ATRACKS"
+    [[ "$PLAN_AUDIO" == "all" ]] && PLAN_AUDIO="${AUDIO_ALL}"
+  fi
+  if [[ -n "$STRACKS" ]]; then
+    PLAN_SUBS="$STRACKS"
+    [[ "$PLAN_SUBS" == "all" ]] && PLAN_SUBS="${SUBS_ALL}"
+  fi
+  [[ $INTERACTIVE -eq 1 ]] && confirm_tracks "$f"
+  rm -f "${P_TABLE:-}"
+  if [[ "$D_ACTION" == "skip" ]]; then
+    TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+    SWEEP_BYTES_TODO=$(( SWEEP_BYTES_TODO - $(filesize "$f") ))
+    continue
+  fi
+  TRACKSRC="rules"
+  [[ "$PLAN_AUDIO" == "${AUDIO_KEEP}" && "$PLAN_SUBS" == "${SUBS_KEEP}" ]] || TRACKSRC="manual"
+  _sz=$(filesize "$f")
+  if shrink_one "$f" "$D_ACTION" "$PLAN_AUDIO" "$PLAN_SUBS" "$TRACKSRC"; then
+    TOTAL_DONE=$((TOTAL_DONE + 1))
+  else
+    TOTAL_FAILED=$((TOTAL_FAILED + 1))
+  fi
+  SWEEP_BYTES_DONE=$(( SWEEP_BYTES_DONE + _sz ))
+  SWEEP_BYTES_TODO=$(( SWEEP_BYTES_TODO - _sz ))
+  sweep_progress "$SWEEP_INDEX" "${#FILES[@]}"
+done
+
+say "Done: $TOTAL_DONE processed, $TOTAL_SKIPPED skipped, $TOTAL_FAILED failed"
+mach "@@summary $TOTAL_DONE $TOTAL_SKIPPED $TOTAL_FAILED"

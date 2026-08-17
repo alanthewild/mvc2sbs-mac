@@ -1,0 +1,1379 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Alan Wild
+# ---------------------------------------------------------------------------
+# mvc2sbs - convert a MakeMKV 3D MVC MKV into a Full-SBS (or HSBS/TAB) MKV
+#           natively on macOS. Replaces the BD3D2MK3D step of the workflow.
+#
+# Pipeline:
+#   1. ffmpeg          copy the MVC video track out as an Annex B .264 file
+#   2. edge264_test    decode base + dependent views, emit side-by-side Y4M
+#   3. ffmpeg/libx264  encode at CRF, mux original audio and subtitles
+#   4. mkvmerge        remux, and carry the source chapters across
+#   5. mkvpropedit     tag the MKV with the correct StereoMode
+#
+# Nothing is re-encoded except the video. Audio and subtitles are stream-copied.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+VERSION="3.61"
+
+# ------------------------------- defaults ----------------------------------
+CRF=16
+PRESET=slow
+LAYOUT=fsbs           # fsbs | hsbs | ftab | htab
+VCODEC=x264           # x264 | x265 | vt
+OUT=""
+TMPROOT=""
+LOGFILE=""
+LOGDIR="${MVC2SBS_LOG_DIR:-$HOME/Library/Logs/mvc2sbs}"
+KEEP=0
+VTRACK=""
+LIMIT=""
+START=""
+EXTRA=""
+DRYRUN=0
+PREVIEW=0
+PREVIEW_FRAME=1440
+INFO=0
+SINGLE=0
+EXTRACTONLY=0
+TENBIT=0
+DARK=0
+MACHINE=0
+PROGRESS=""
+NOAUDIO=0
+NOSUBS=0
+NOCHAPTERS=0
+FLATSUBS=0
+SUBDEPTH=0
+SUBBRIGHT=1.0
+SUBCOLOUR=source
+SUBOPACITY=1.0
+VTQUALITY=62
+ATRACKS=""
+STRACKS=""
+THREADS=""
+MAXRATE=""
+SWAPEYES=0
+
+usage() {
+  cat <<EOF
+mvc2sbs $VERSION
+
+  mvc2sbs [options] INPUT.mkv
+
+Options
+  -o FILE           output file (default: INPUT.3D-<layout>.mkv)
+  -q, --crf N       x264/x265 CRF (default: $CRF; BD3D2MK3D users want 16 or 18)
+  -p, --preset P    encoder preset (default: $PRESET)
+      --layout L    fsbs | hsbs | ftab | htab   (default: $LAYOUT)
+                      fsbs = full side-by-side, 3840x1080, no resampling
+                      hsbs = half side-by-side, 1920x1080
+                      ftab = full top-and-bottom, 1920x2160
+                      htab = half top-and-bottom, 1920x1080
+      --10bit       encode 10-bit from the 8-bit source. Takes dither retention
+                    from around 52% to around 90% on a dark ramp, which is what
+                    stops banding, at no cost in size. With --x265 or --vt the
+                    result is HEVC Main 10, confirmed playing at 3840x1080 on a
+                    2017 Shield. With x264 it is High 10, which a 2017
+                    Shield refuses outright: Jellyfin reports "the video codec's
+                    profile is not supported" and transcodes it.
+      --dark        tuning for dark gradients. Dither is what stops banding, so
+                    the aim is to keep it. x264: aq-mode 3 plus dct-decimate=0,
+                    worth 5 points of dither retention at 8-bit and 8 at 10-bit.
+                    x265: aq-mode 3 plus sao=0, since SAO smooths dither away.
+                    Measured to be worth little at 10-bit on either encoder,
+                    where the bit depth has already done the work.
+      --x265        encode HEVC instead of AVC
+      --vt          encode with Apple VideoToolbox HEVC on the media engine.
+                    Measured at quality 62 it matched x265 CRF 20 preset slow on
+                    both PSNR and SSIM against a common reference, 8% larger and
+                    27 times faster: 15 seconds against 6m47 for one minute of
+                    3840x1080. A feature takes about 25 minutes.
+      --vt-quality N  VideoToolbox quality, 1 to 100 (default $VTQUALITY). Not a
+                    CRF: higher is better. 62 matches x265 CRF 20, 55 is roughly
+                    half the size and measurably softer, above 65 is waste.
+      --video-track N  force source video track index (default: auto-detect MVC)
+      --temp DIR    scratch directory for the intermediate .264 (default: next
+                    to the output file). Needs roughly the size of the video
+                    track, so 25-45 GB for a feature film.
+      --keep-temp   do not delete the intermediate .264 (lets you re-run the
+                    encode without re-extracting)
+      --log FILE    write the console log here
+      --log-dir DIR log directory (default: ~/Library/Logs/mvc2sbs, one file
+                    per run, named for the source)
+      --no-log      do not write a log file
+      --limit SEC   encode only the first SEC seconds (test runs)
+      --start SEC   skip the first SEC seconds
+      --no-audio    drop audio
+      --no-subs     drop subtitles
+      --no-chapters drop chapters. Some players show a black screen and play no
+                    audio on a file whose chapters they dislike
+      --audio-tracks L  comma list of audio tracks to keep, 0-based in source
+                    order, e.g. 0,2 (default: all)
+      --sub-tracks L    same for subtitles (default: all)
+      --flat-subs   keep the original 2D PGS subtitles. They will render into
+                    the left eye only on a side-by-side frame.
+      --sub-depth N disparity in pixels for the 3D subtitles, positive puts them
+                    in front of the screen plane (default 0, screen depth)
+      --sub-brightness G  gamma on subtitle luminance. Below 1 brightens the
+                    anti-aliased edges, which is what goes grey when a player
+                    squeezes a 3840 wide subtitle plane onto a 1080p display.
+                    Try 0.7. Palettes only, the bitmaps are untouched.
+      --sub-colour C  source, white, yellow, cyan, green or amber
+      --sub-opacity F  multiplier on subtitle alpha (default 1.0)
+      --maxrate M   cap the peak bitrate at M Mbps (VBV). CRF alone has no
+                    ceiling, so a demanding scene can peak several times the
+                    average. That is what stalls a player streaming over a
+                    network or a set-top decoder near its limit. 60 is a
+                    sensible cap for 3840x1080. Costs quality only in the few
+                    scenes that were above the cap.
+      --swap-eyes   rebuild the frame with the right eye first. Only needed for
+                    players that ignore the StereoMode flag, since flipping the
+                    flag fixes it with no re-encode at all:
+                      mkvpropedit FILE --edit track:v1 --set stereo-mode=11
+                    Jellyfin on an Nvidia Shield honours the flag, so try that
+                    first. Diagnose with: mkvdiff --eyes FILE
+      --threads N   encoder threads (default: all cores)
+      --extra "..." extra args passed straight to ffmpeg before the output
+      --preview     decode one frame to PNG, measure the left/right difference,
+                    and exit without encoding
+      --preview-frame N  same, at frame N (default $PREVIEW_FRAME, about 1 minute in)
+      --info        list tracks, scan 20s of bitstream for MVC NAL units, check
+                    both views decode, then exit
+      --extract-only  pull the elementary stream out and stop. Useful when the
+                    source is on a NAS: extraction is network-bound and the
+                    encode is CPU-bound, so you can extract the next film while
+                    the current one encodes. Implies --keep-temp.
+      --machine     emit machine-readable @@ status lines on stdout (for GUIs)
+      --progress F  have the encoder write FFmpeg -progress key=value data to F
+      --single-thread  slower but more tolerant decoding, for problem discs
+  -n, --dry-run     print the commands and exit
+  -V, --version     print the version and exit
+  -h, --help        this text
+
+Examples
+  mvc2sbs Movie_t00.mkv
+  mvc2sbs -q 18 -p slower --layout fsbs -o /Volumes/Media/Movie.3D.mkv in.mkv
+  mvc2sbs --preview in.mkv
+  mvc2sbs --limit 60 -p ultrafast in.mkv        # 1 minute smoke test
+  mvc2sbs --vt --10bit --vt-quality 62 in.mkv   # the recommended settings
+EOF
+}
+
+say()  { printf '\033[1;36m==>\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; mach "@@warn $*"; }
+die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; mach "@@error $*"; exit 1; }
+# Machine-readable status for GUI front ends. Human text always goes to stderr,
+# so stdout carries nothing but @@ lines and stays trivially parseable.
+mach() { if [[ ${MACHINE:-0} -eq 1 ]]; then printf '%s\n' "${*//$'\n'/ }"; fi; }
+
+# ------------------------------- args --------------------------------------
+IN=""
+ORIG_ARGS=("$@")
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o)              OUT="$2"; shift 2 ;;
+    -q|--crf)        CRF="$2"; shift 2 ;;
+    -p|--preset)     PRESET="$2"; shift 2 ;;
+    --layout)        LAYOUT="$2"; shift 2 ;;
+    --x265)          VCODEC=x265; shift ;;
+    --vt)            VCODEC=vt; shift ;;
+    --vt-quality)    VTQUALITY="$2"; shift 2 ;;
+    --video-track)   VTRACK="$2"; shift 2 ;;
+    --temp)          TMPROOT="$2"; shift 2 ;;
+    --log)           LOGFILE="$2"; shift 2 ;;
+    --log-dir)       LOGDIR="$2"; shift 2 ;;
+    --no-log)        LOGDIR="none"; shift ;;
+    --keep-temp)     KEEP=1; shift ;;
+    --limit)         LIMIT="$2"; shift 2 ;;
+    --start)         START="$2"; shift 2 ;;
+    --no-audio)      NOAUDIO=1; shift ;;
+    --no-subs)       NOSUBS=1; shift ;;
+    --no-chapters)   NOCHAPTERS=1; shift ;;
+    --audio-tracks)  ATRACKS="$2"; shift 2 ;;
+    --sub-tracks)    STRACKS="$2"; shift 2 ;;
+    --flat-subs)     FLATSUBS=1; shift ;;
+    --sub-depth)     SUBDEPTH="$2"; shift 2 ;;
+    --sub-brightness) SUBBRIGHT="$2"; shift 2 ;;
+    --sub-colour|--sub-color) SUBCOLOUR="$2"; shift 2 ;;
+    --sub-opacity)   SUBOPACITY="$2"; shift 2 ;;
+    --maxrate)       MAXRATE="$2"; shift 2 ;;
+    --swap-eyes)     SWAPEYES=1; shift ;;
+    --threads)       THREADS="$2"; shift 2 ;;
+    --extra)         EXTRA="$2"; shift 2 ;;
+    --preview)       PREVIEW=1; shift ;;
+    --preview-frame) PREVIEW_FRAME="$2"; PREVIEW=1; shift 2 ;;
+    --info)          INFO=1; shift ;;
+    --extract-only)  EXTRACTONLY=1; KEEP=1; shift ;;
+    --machine)       MACHINE=1; shift ;;
+    --progress)      PROGRESS="$2"; shift 2 ;;
+    --single-thread) SINGLE=1; shift ;;
+    --10bit)         TENBIT=1; shift ;;
+    --dark)          DARK=1; shift ;;
+    -n|--dry-run)    DRYRUN=1; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    -V|--version)    echo "mvc2sbs $VERSION"; exit 0 ;;
+    -*)              die "unknown option: $1" ;;
+    # A second bare filename is nearly always two commands pasted onto one
+    # line. Silently taking the last one and encoding the wrong file is a
+    # miserable way to spend three hours.
+    *)               [[ -z "$IN" ]] || die "two input files given: '$IN' and '$1'.
+      If you meant to run two commands, put them on separate lines."
+                     IN="$1"; shift ;;
+  esac
+done
+
+[[ -n "$IN" ]] || { usage; exit 1; }
+[[ -f "$IN" ]] || die "no such file: $IN"
+
+case "$LAYOUT" in fsbs|hsbs|ftab|htab) ;; *) die "bad --layout: $LAYOUT" ;; esac
+
+# ------------------------------- tools -------------------------------------
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 not found in PATH. Run install-mac3d.sh"; }
+need ffmpeg; need ffprobe; need edge264_test
+
+say "mvc2sbs $VERSION"
+mach "@@version $VERSION"
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PGS3D=""
+for _c in "$SELF_DIR/pgs3d.py" "$(command -v pgs3d.py 2>/dev/null || true)"; do
+  [[ -n "$_c" && -f "$_c" ]] && { PGS3D="$_c"; break; }
+done
+command -v mkvpropedit >/dev/null 2>&1 || warn "mkvpropedit not found, the StereoMode flag will not be set"
+
+# Checked here, at the start, not at the end. Deciding this just before the mux
+# means finding out after a three hour encode. A file muxed by FFmpeg is refused
+# outright by some players, carries no chapters and no record of its settings,
+# and looks perfectly fine until you try to play it.
+if ! command -v mkvmerge >/dev/null 2>&1 || ! command -v mkvextract >/dev/null 2>&1; then
+  warn "MKVToolNix is not on the PATH this process can see, so FFmpeg will write
+      the container. That file will carry no chapters, no record of its
+      settings, and is refused outright by Jellyfin on an Nvidia Shield.
+      Install it with: brew install mkvtoolnix
+      Set MVC2SBS_ALLOW_FFMPEG_MUX=1 if you want to proceed anyway."
+  if [[ "${MVC2SBS_ALLOW_FFMPEG_MUX:-0}" != "1" ]]; then
+    die "refusing to spend an encode on a container that will not play.
+      Fix the PATH, or set MVC2SBS_ALLOW_FFMPEG_MUX=1 to override."
+  fi
+fi
+
+# -O side-by-side Y4M on stdout, -m multi-threaded, -k skip the unsupported
+# type-24 NAL units that real 3D Blu-rays carry. -s forces single-threaded.
+EDGE_FLAGS="-Omk"
+[[ "${MVC2SBS_SINGLE_THREAD:-0}" == "1" || $SINGLE -eq 1 ]] && EDGE_FLAGS="-Osk"
+
+# ------------------------------- paths -------------------------------------
+INDIR="$(cd "$(dirname "$IN")" && pwd)"
+INBASE="$(basename "${IN%.*}")"
+[[ -n "$OUT" ]] || OUT="${INDIR}/${INBASE}.3D-${LAYOUT}.mkv"
+OUTDIR="$(cd "$(dirname "$OUT")" && pwd)"
+# Is this path on a local volume? A network mount reports its share rather than
+# a /dev node as the device.
+is_local_volume() {
+  local dev
+  dev="$(df -P "$1" 2>/dev/null | tail -1 | awk '{print $1}')"
+  [[ "$dev" == /dev/* ]]
+}
+
+if [[ -n "$TMPROOT" ]]; then
+  is_local_volume "$TMPROOT" || warn "the scratch directory is on a network volume.
+      The decoder memory-maps that file and reads it continuously, so this will
+      be slow and may be unreliable. Point --temp at local storage."
+else
+  # Default is beside the output, but never on a network share. Writing 30 GB
+  # over the network and then memory-mapping it back is the worst case.
+  if is_local_volume "$OUTDIR"; then
+    TMPROOT="$OUTDIR"
+  else
+    TMPROOT="${TMPDIR:-/tmp}"
+    say "Output is on a network volume, so the scratch stream goes to $TMPROOT instead"
+  fi
+fi
+mkdir -p "$TMPROOT"
+H264="${TMPROOT}/${INBASE}.mvc.264"
+
+# ------------------------------- log file ----------------------------------
+# An encode prints an hour of diagnostics and the line that explains a bad file
+# is always the one that scrolled away. Everything on stderr is copied to a log
+# beside the others, named for the source. Not into the output folder: a media
+# library gets scanned, and a stray .log in it is clutter.
+if [[ "$LOGDIR" == "none" ]]; then
+  LOGFILE=""
+elif [[ -z "$LOGFILE" && $DRYRUN -eq 0 && $INFO -eq 0 ]]; then
+  mkdir -p "$LOGDIR" 2>/dev/null &&
+    LOGFILE="${LOGDIR}/${INBASE}-$(date +%Y%m%d-%H%M%S).log"
+fi
+
+# tee copies bytes, not lines, so ffmpeg's carriage-return progress redraw still
+# behaves on the terminal. The colour codes and the redraws are cleaned out of
+# the file at exit, not on the way in.
+finalise_log() {
+  [[ -n "${LOGFILE:-}" && -f "${LOGFILE:-}" ]] || return 0
+  sleep 0.2
+  python3 - "$LOGFILE" <<'PYEOF' 2>/dev/null || true
+import re, sys
+p = sys.argv[1]
+d = open(p, "rb").read().decode("utf-8", "replace")
+d = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", d)
+# ffmpeg redraws one status line with \r. Keep the final state of each redraw.
+d = "\n".join(l.split("\r")[-1] for l in d.split("\n"))
+open(p, "w", encoding="utf-8").write(d)
+PYEOF
+}
+
+if [[ -n "$LOGFILE" ]]; then
+  if : >> "$LOGFILE" 2>/dev/null; then
+    {
+      printf 'mvc2sbs %s\n' "$VERSION"
+      printf 'started %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+      printf 'command '
+      printf '%q ' "$0" "${ORIG_ARGS[@]}"
+      printf '\n\n'
+    } >> "$LOGFILE"
+    exec 2> >(tee -a "$LOGFILE" >&2)
+  else
+    LOGFILE=""
+  fi
+fi
+
+# A staging file is a full-size encode. Leaving one in scratch after a stop or a
+# crash silently eats tens of gigabytes.
+cleanup_stage() {
+  [[ -n "${STAGE:-}" && "${STAGE:-}" != "${OUT:-}" && -f "${STAGE:-}" ]] && rm -f "$STAGE"
+  return 0
+}
+
+# Never leave a multi-GB scratch file behind, including on error or Ctrl-C.
+cleanup() {
+  # The staging encode goes regardless of --keep-temp: that flag exists to skip
+  # re-extracting, and a half-written staging file is no use to anything.
+  cleanup_stage
+  if [[ $KEEP -ne 1 ]]; then
+    rm -f "${H264:-}"
+    rm -f ${SUP_SRC[@]+"${SUP_SRC[@]}"} ${SUP_3D[@]+"${SUP_3D[@]}"}
+  fi
+  finalise_log
+  return 0
+}
+trap cleanup EXIT
+
+# Terminating this script must take the whole pipeline with it, otherwise a GUI
+# front end pressing Cancel leaves ffmpeg and the decoder running detached.
+# Children are killed depth first: a pipeline runs in a subshell, so the decoder
+# is a grandchild and a single pkill -P would miss it.
+kill_tree() {  # $1 = signal, $2 = pid
+  local sig="$1" p="$2" c
+  for c in $(pgrep -P "$p" 2>/dev/null); do kill_tree "$sig" "$c"; done
+  kill "-$sig" "$p" 2>/dev/null || true
+}
+on_signal() {
+  trap '' INT TERM
+  warn "interrupted, stopping the pipeline"
+  mach "@@stage stopping"
+  local c
+  for c in $(pgrep -P $$ 2>/dev/null); do kill_tree TERM "$c"; done
+  # FFmpeg takes a few seconds to flush and finalise on SIGTERM, which is what
+  # we want. Give it a bounded grace period, then insist, so a front end
+  # pressing Cancel never waits forever on a wedged child.
+  local waited=0
+  while pgrep -P $$ >/dev/null 2>&1 && [[ $waited -lt 20 ]]; do
+    sleep 0.5; waited=$((waited + 1))
+  done
+  for c in $(pgrep -P $$ 2>/dev/null); do kill_tree KILL "$c"; done
+  exit 130
+}
+trap on_signal INT TERM
+
+# Run a command in the background and wait on it. Bash will not service a trap
+# while it is blocked on a FOREGROUND child, so anything long running has to go
+# through here or Cancel does nothing until the command finishes on its own.
+run_interruptible() {
+  "$@" &
+  local pid=$!
+  local rc=0
+  wait "$pid" || rc=$?
+  return "$rc"
+}
+
+# ------------------------------- probe -------------------------------------
+mach "@@stage probe"
+say "Probing $(basename "$IN")"
+
+# List the video tracks for context only. The codec ID is not evidence either
+# way: MakeMKV normally labels the track V_MPEG4/ISO/AVC even when both views
+# are inside it. The bitstream NAL scan further down is the real test.
+if command -v mkvmerge >/dev/null 2>&1 && [[ "$IN" == *.mkv ]]; then
+  read -r -d '' PROBE_PY <<'PY' || true
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+tracks = d.get("tracks", [])
+vs = [t for t in tracks if t.get("type") == "video"]
+mvc = []
+for i, t in enumerate(vs):
+    p = t.get("properties", {})
+    cid = p.get("codec_id", "?")
+    dim = p.get("pixel_dimensions", "?")
+    sys.stderr.write("      v:%d  mkv-track %s  %s  %s\n" % (i, t.get("id"), cid, dim))
+    if "MVC" in cid.upper():
+        mvc.append(i)
+na = sum(1 for t in tracks if t.get("type") == "audio")
+ns = sum(1 for t in tracks if t.get("type") == "subtitles")
+sys.stderr.write("      %d audio, %d subtitle track(s)\n" % (na, ns))
+print(",".join(str(i) for i in mvc))
+PY
+  MVC_AT="$(mkvmerge -J "$IN" 2>/dev/null | python3 -c "$PROBE_PY" || true)"
+  # A missing V_MPEG4/ISO/MVC codec ID means nothing. MakeMKV normally writes
+  # both views into one track labelled V_MPEG4/ISO/AVC, with the subset SPS and
+  # dependent-view slices carried in band. The bitstream scan below is the only
+  # answer that counts.
+  if [[ -n "$MVC_AT" && -z "$VTRACK" ]]; then
+    VTRACK="${MVC_AT%%,*}"
+  fi
+fi
+
+[[ -n "$VTRACK" ]] || VTRACK=0
+say "Using source video stream v:$VTRACK"
+
+# csv=p=0 emits a stray trailing separator on some FFmpeg builds, so read one
+# entry at a time and strip anything that is not part of the value.
+probe1() {
+  ffprobe -v error -select_streams "v:$VTRACK" -show_entries "stream=$1" \
+          -of default=nw=1:nk=1 "$IN" 2>/dev/null | head -1 | tr -d '[:space:],'
+}
+SRC_W="$(probe1 width)"
+SRC_H="$(probe1 height)"
+SRC_FR="$(probe1 r_frame_rate)"
+[[ "$SRC_W" =~ ^[0-9]+$ ]] || die "could not read width of video stream v:$VTRACK (got '$SRC_W')"
+say "Base view: ${SRC_W}x${SRC_H} @ ${SRC_FR}"
+
+# frames -> seconds, for limiting how much of the stream we bother extracting
+FPS_NUM="${SRC_FR%%/*}"; FPS_DEN="${SRC_FR##*/}"
+[[ "$FPS_DEN" == "$FPS_NUM" ]] && FPS_DEN=1
+frames_to_sec() { echo $(( ($1 * FPS_DEN + FPS_NUM - 1) / FPS_NUM )); }
+
+SRC_DUR_S="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$IN" \
+             2>/dev/null | head -1 | tr -d '[:space:],')"
+[[ "$SRC_DUR_S" =~ ^[0-9.]+$ ]] || SRC_DUR_S=0
+TOTAL_FRAMES="$(python3 -c 'import sys;print(int(float(sys.argv[1])*int(sys.argv[2])/int(sys.argv[3])))' \
+                "$SRC_DUR_S" "$FPS_NUM" "$FPS_DEN" 2>/dev/null || echo 0)"
+mach "@@version 1"
+mach "@@source $IN"
+mach "@@output $OUT"
+mach "@@video $SRC_W $SRC_H $FPS_NUM $FPS_DEN"
+mach "@@duration $SRC_DUR_S"
+mach "@@totalframes $TOTAL_FRAMES"
+
+# --------------------------- subtitle planning -----------------------------
+# PGS subtitles are authored against a 1920 wide frame. Copied unchanged onto a
+# 3840 wide side-by-side frame they land in the left eye only, which is why 2D
+# subtitle tracks look broken in 3D players. pgs3d.py duplicates each
+# composition object into the second eye without touching the bitmaps.
+read -r -d '' SUBS_PY <<'SUBPY' || true
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+subs = [x for x in d.get("streams", []) if x.get("codec_type") == "subtitle"]
+for i, st in enumerate(subs):
+    lang = (st.get("tags") or {}).get("language", "und")
+    print("%d|%s|%s" % (i, st.get("codec_name", "?"), lang))
+SUBPY
+SUBS_RAW="$(ffprobe -v error -show_streams -of json "$IN" 2>/dev/null | python3 -c "$SUBS_PY" || true)"
+
+SUB_IDX=(); SUB_LANG=(); SUB_CODEC=()
+if [[ $NOSUBS -eq 0 && -n "$SUBS_RAW" ]]; then
+  while IFS='|' read -r _i _codec _lang; do
+    [[ -z "$_i" ]] && continue
+    if [[ -n "$STRACKS" ]]; then
+      case ",$STRACKS," in *",$_i,"*) ;; *) continue ;; esac
+    fi
+    SUB_IDX+=("$_i"); SUB_CODEC+=("$_codec"); SUB_LANG+=("$_lang")
+  done <<< "$SUBS_RAW"
+fi
+
+SUB3D=0
+if [[ $FLATSUBS -eq 0 && ${#SUB_IDX[@]} -gt 0 ]]; then
+  case "$LAYOUT" in
+    fsbs|ftab) SUB3D=1 ;;
+    *) warn "3D subtitles need a 1:1 layout. On $LAYOUT the bitmaps would have
+      to be rescaled, so the original 2D subtitles are copied instead." ;;
+  esac
+  if [[ $SUB3D -eq 1 && -z "$PGS3D" ]]; then
+    warn "pgs3d.py not found next to mvc2sbs, falling back to flat subtitles"
+    SUB3D=0
+  fi
+  if [[ $SUB3D -eq 1 ]]; then
+    for _c in "${SUB_CODEC[@]}"; do
+      [[ "$_c" == "hdmv_pgs_subtitle" ]] || {
+        warn "subtitle codec $_c is not PGS, copying subtitles unchanged"; SUB3D=0; break; }
+    done
+  fi
+fi
+[[ $SUB3D -eq 1 ]] && say "Will rebuild ${#SUB_IDX[@]} PGS subtitle track(s) for $LAYOUT"
+
+# ------------------------------- extract -----------------------------------
+# Only extract as much of the elementary stream as the job actually needs.
+# A --preview or --limit run has no business writing 35 GB to disk.
+EXTRACT_SEC=""
+if [[ $INFO -eq 1 ]]; then
+  EXTRACT_SEC=20
+elif [[ $PREVIEW -eq 1 ]]; then
+  EXTRACT_SEC=$(( $(frames_to_sec "$PREVIEW_FRAME") + 15 ))
+elif [[ -n "$LIMIT" ]]; then
+  # With --start the extraction seeks, so only the requested window is needed
+  # rather than everything from the beginning of the film.
+  _lim="${LIMIT%.*}"
+  EXTRACT_SEC=$(( _lim + 15 ))
+fi
+
+if [[ -n "$EXTRACT_SEC" ]]; then
+  H264="${TMPROOT}/${INBASE}.mvc.first${EXTRACT_SEC}s.264"
+fi
+
+# Seek here, on the source, not on the decoded stream.
+#
+# --start used to be handled by passing -ss to the encoder, whose video input is
+# the decoder's Y4M pipe. A pipe cannot seek, so FFmpeg satisfied it by reading
+# and discarding: every frame from the start of the film was fully decoded and
+# thrown away before the first frame was encoded. On a feature that is tens of
+# thousands of wasted frames before anything happens. It also left the audio
+# unseeked, so the output carried video from the requested point against audio
+# from the beginning of the film.
+#
+# Seeking the source instead costs nothing and keeps the streams together.
+EXTRACT=(ffmpeg -hide_banner -loglevel error -stats -nostdin -y)
+[[ -n "$START" ]] && EXTRACT+=(-ss "$START")
+EXTRACT+=(-i "$IN" -map "0:v:$VTRACK" -c copy -bsf:v h264_mp4toannexb)
+[[ -n "$EXTRACT_SEC" ]] && EXTRACT+=(-t "$EXTRACT_SEC")
+EXTRACT+=(-f h264 "$H264")
+
+SUP_SRC=(); SUP_3D=()
+for ((_k = 0; _k < ${#SUB_IDX[@]}; _k++)); do
+  SUP_SRC+=("${TMPROOT}/${INBASE}.sub${SUB_IDX[$_k]}.sup")
+  SUP_3D+=("${TMPROOT}/${INBASE}.sub${SUB_IDX[$_k]}.3d.sup")
+done
+
+# Same read of the source produces both the video stream and the subtitles.
+if [[ $SUB3D -eq 1 ]]; then
+  for ((_k = 0; _k < ${#SUB_IDX[@]}; _k++)); do
+    EXTRACT+=(-map "0:s:${SUB_IDX[$_k]}" -c:s copy)
+    [[ -n "$EXTRACT_SEC" ]] && EXTRACT+=(-t "$EXTRACT_SEC")
+    EXTRACT+=(-f sup "${SUP_SRC[$_k]}")
+  done
+fi
+
+if [[ $DRYRUN -eq 1 ]]; then
+  printf '%q ' "${EXTRACT[@]}"; echo
+else
+  if [[ -s "$H264" && $KEEP -eq 1 ]]; then
+    say "Reusing existing $(basename "$H264")"
+    if [[ $SUB3D -eq 1 ]]; then
+      for ((_k = 0; _k < ${#SUB_IDX[@]}; _k++)); do
+        if [[ ! -s "${SUP_SRC[$_k]}" ]]; then
+          say "Extracting subtitle track ${SUB_IDX[$_k]}"
+          ffmpeg -hide_banner -loglevel error -nostdin -y -i "$IN" \
+                 -map "0:s:${SUB_IDX[$_k]}" -c:s copy -f sup "${SUP_SRC[$_k]}" || true
+        fi
+      done
+    fi
+  else
+    if [[ -n "$EXTRACT_SEC" ]]; then
+      mach "@@stage extract"
+      if [[ -n "$START" ]]; then
+        say "Extracting ${EXTRACT_SEC}s from ${START}s -> $(basename "$H264")"
+        say "Seeking snaps back to the nearest keyframe, so the picture may
+      begin a second or two before ${START}s and lead the audio by that much.
+      Fine for comparing encodes, not for judging sync."
+      else
+        say "Extracting first ${EXTRACT_SEC}s of the MVC stream -> $(basename "$H264")"
+      fi
+    else
+      mach "@@stage extract"
+      say "Extracting full MVC elementary stream -> $(basename "$H264")"
+      AVAIL_KB="$(df -Pk "$TMPROOT" | tail -1 | awk '{print $4}')"
+      SRC_KB="$(( $(stat -f%z "$IN" 2>/dev/null || stat -c%s "$IN") / 1024 ))"
+      # The elementary stream and the staging encode both live here. The
+      # finished file goes to the destination, not to scratch.
+      if [[ "$AVAIL_KB" -lt $((SRC_KB * 2)) ]]; then
+        warn "only $((AVAIL_KB/1024/1024)) GB free in $TMPROOT. The elementary
+      stream is about $((SRC_KB/1024/1024)) GB and the staging encode sits
+      beside it until the remux finishes."
+      fi
+    fi
+    warn "'sps_id N out of range' below is expected and harmless: it is FFmpeg's
+      2D H.264 parser complaining about the MVC subset SPS while copying it."
+    run_interruptible "${EXTRACT[@]}"
+    echo >&2
+  fi
+fi
+
+# --------------------------- MVC sanity check ------------------------------
+# Codec IDs lie. MakeMKV labels the track V_MPEG4/ISO/AVC even when both views
+# are inside it. What actually proves MVC is the presence of NAL type 15
+# (subset SPS) and type 20 (coded slice extension, the dependent view).
+read -r -d '' NALSCAN_PY <<'PY' || true
+import re, sys
+NAMES = {1: "non-IDR slice", 5: "IDR slice", 6: "SEI", 7: "SPS", 8: "PPS",
+         9: "AU delimiter", 14: "prefix NAL (MVC)", 15: "subset SPS (MVC)",
+         20: "slice extension (MVC dependent view)", 24: "unspecified (3D BD)"}
+data = open(sys.argv[1], "rb").read(int(sys.argv[2]))
+counts = {}
+for m in re.finditer(b"\x00\x00\x01", data):
+    p = m.end()
+    if p < len(data):
+        t = data[p] & 0x1F
+        counts[t] = counts.get(t, 0) + 1
+for t in sorted(counts):
+    sys.stderr.write("      NAL type %-3d %-38s x%d\n" % (t, NAMES.get(t, ""), counts[t]))
+print("yes" if (20 in counts and 15 in counts) else "no")
+PY
+
+if [[ $DRYRUN -eq 0 ]]; then
+  mach "@@stage scan"
+  say "Scanning the elementary stream for MVC NAL units"
+  HAS_MVC="$(python3 -c "$NALSCAN_PY" "$H264" $((256*1024*1024)) || echo no)"
+  if [[ "$HAS_MVC" == "yes" ]]; then
+    mach "@@mvc yes"
+    say "MVC dependent view is present in the bitstream"
+  else
+    mach "@@mvc no"
+    warn "no subset SPS / slice extension NALs found in the scanned window"
+  fi
+
+  say "Checking that the dependent (right eye) view decodes"
+  set +o pipefail
+  HDR_SBS="$(edge264_test "$H264" "$EDGE_FLAGS" 2>/dev/null | dd bs=1 count=200 2>/dev/null | head -1)"
+  set -o pipefail
+  [[ "$HDR_SBS" == YUV4MPEG2* ]] || die "edge264_test produced no Y4M stream at all."
+  DEC_W="$(sed -E 's/.* W([0-9]+) .*/\1/' <<<"$HDR_SBS")"
+  DEC_H="$(sed -E 's/.* H([0-9]+) .*/\1/' <<<"$HDR_SBS")"
+  say "Decoder output: ${DEC_W}x${DEC_H}  ($HDR_SBS)"
+  if [[ "$DEC_W" -le "$SRC_W" && "${MVC2SBS_SKIP_MVC_CHECK:-0}" != "1" ]]; then
+    if [[ "$HAS_MVC" == "yes" ]]; then
+      die "The MVC dependent view IS in the bitstream but the decoder only
+     returned one view (${DEC_W}px, base view is ${SRC_W}px). That is a decoder
+     problem, not a bad rip. Try --single-thread, and send me this output."
+    fi
+    die "Decoder returned a single view (${DEC_W}px wide, base view is ${SRC_W}px)
+     and no MVC NAL units were found. In MakeMKV, tick the video track labelled
+     'Mpeg4 MVC' before ripping. It is off by default."
+  fi
+  mach "@@decoder $DEC_W $DEC_H"
+  say "Both views decode. Output frame will be ${DEC_W}x${DEC_H}."
+fi
+
+if [[ $INFO -eq 1 ]]; then
+  [[ $KEEP -eq 1 ]] || rm -f "$H264"
+  exit 0
+fi
+
+if [[ $EXTRACTONLY -eq 1 ]]; then
+  say "Extracted and verified. Re-run the same command without --extract-only
+      (keeping --keep-temp) to encode without touching the network again:"
+  printf '      %s\n' "$H264" >&2
+  exit 0
+fi
+
+# --------------------------- 3D subtitle build -----------------------------
+if [[ $SUB3D -eq 1 && $DRYRUN -eq 0 && $PREVIEW -eq 0 ]]; then
+  SUB_W=$(( SRC_W * 2 )); SUB_H="$SRC_H"; STACKARG=()
+  if [[ "$LAYOUT" == "ftab" ]]; then
+    SUB_W="$SRC_W"; SUB_H=$(( SRC_H * 2 )); STACKARG=(--stack)
+  fi
+  say "Rebuilding subtitles for ${SUB_W}x${SUB_H} (depth ${SUBDEPTH}px)"
+  for ((_k = 0; _k < ${#SUB_IDX[@]}; _k++)); do
+    if [[ ! -s "${SUP_SRC[$_k]}" ]]; then
+      warn "subtitle track ${SUB_IDX[$_k]} extracted empty, falling back to flat subtitles"
+      SUB3D=0; break
+    fi
+    if ! python3 "$PGS3D" "${SUP_SRC[$_k]}" "${SUP_3D[$_k]}" \
+         --width "$SUB_W" --height "$SUB_H" --depth "$SUBDEPTH" \
+         --brightness "$SUBBRIGHT" --colour "$SUBCOLOUR" --opacity "$SUBOPACITY" \
+         ${STACKARG[@]+"${STACKARG[@]}"}; then
+      warn "pgs3d failed on track ${SUB_IDX[$_k]}, falling back to flat subtitles"
+      SUB3D=0; break
+    fi
+  done
+  [[ $SUB3D -eq 1 ]] && mach "@@subs3d ${#SUB_IDX[@]}"
+fi
+
+# ------------------------------- preview -----------------------------------
+if [[ $PREVIEW -eq 1 ]]; then
+  PNG="${OUT%.mkv}.preview.png"
+  grab_frame() {
+    set +o pipefail
+    edge264_test "$H264" "$EDGE_FLAGS" 2>/dev/null \
+      | ffmpeg -hide_banner -loglevel error -y -thread_queue_size 512 \
+          -f yuv4mpegpipe -i - -vf "select=gte(n\,$1)" -frames:v 1 "$PNG" || true
+    set -o pipefail
+  }
+  mach "@@preview $PNG"
+  say "Writing preview frame -> $PNG"
+  grab_frame "$PREVIEW_FRAME"
+  [[ -s "$PNG" ]] || { warn "frame $PREVIEW_FRAME not reached, falling back to frame 0"; grab_frame 0; }
+  [[ -s "$PNG" ]] || die "could not produce a preview frame"
+
+  # Do not make the user eyeball it. Distant scenes have tiny disparity and are
+  # nearly impossible to judge by eye, but pixel-identical halves are obvious to
+  # a difference metric: identical images give PSNR inf.
+  # Only meaningful on a genuinely side-by-side frame. On a single-view frame
+  # the two halves are different parts of one picture, which says nothing.
+  if [[ "${DEC_W:-0}" -gt "$SRC_W" ]]; then
+    PSNR_AVG="$(ffmpeg -hide_banner -loglevel info -i "$PNG" -filter_complex \
+        "[0:v]crop=iw/2:ih:0:0[l];[0:v]crop=iw/2:ih:iw/2:0[r];[l][r]psnr" -f null - 2>&1 \
+        | sed -n 's/.*PSNR .*average:\([0-9a-z.]*\).*/\1/p' | tail -1)"
+    case "$PSNR_AVG" in
+      inf)
+        warn "The two halves are pixel-identical (PSNR inf). The dependent view
+      did NOT decode. Do not start a full encode." ;;
+      "")
+        warn "could not measure the left/right difference" ;;
+      *)
+            mach "@@psnr $PSNR_AVG"
+        say "Left/right difference: PSNR ${PSNR_AVG} dB"
+        if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 45 else 1)" "$PSNR_AVG" 2>/dev/null; then
+          warn "Above 45 dB the two eyes are almost identical. Both views did
+      decode, since identical frames would read as inf, but this frame has
+      almost no depth. Common on logos, titles, fades and near-black shots.
+      Try a frame with something close to camera: --preview-frame 30000"
+        else
+          say "Below 45 dB means real disparity, so this frame is genuinely stereo."
+        fi ;;
+    esac
+  fi
+  say "Left half is the left eye. For a visual check pick a frame with something
+      in the foreground: distant scenes have almost no disparity to see."
+  [[ $KEEP -eq 1 ]] || rm -f "$H264"
+  exit 0
+fi
+
+# ------------------------------- filters -----------------------------------
+# Label the frames rather than let FFmpeg convert them.
+#
+# The Y4M coming out of the decoder carries no colour tags. Asking for bt709 on
+# the output is a conversion request to FFmpeg 8, not a labelling one, and
+# converting transfer characteristics means going through linear light, so
+# swscale routes yuv420p through 16-bit RGB. That shows up as "No accelerated
+# colorspace conversion found from yuv420p to bgr48le" and it is a full colour
+# round trip on every frame. setparams tags the frames instead, so the input and
+# the requested output already agree and nothing is converted.
+#
+# It only bites at 10-bit, because at 8-bit the pixel format does not change and
+# no scaler is inserted at all. Applied unconditionally anyway: the source is
+# Rec.709 either way, and labelling it correctly costs nothing.
+SETPARAMS="setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+
+# The decoder emits base view (left eye) on the left. --swap-eyes rebuilds the
+# frame the other way round rather than only relabelling it, because a TV in
+# manual side-by-side mode ignores the StereoMode flag entirely and just splits
+# the frame. Relabelling alone would fix flag-aware players and nothing else.
+if [[ $SWAPEYES -eq 0 ]]; then
+  _EYES="[a]crop=iw/2:ih:0:0[one];[b]crop=iw/2:ih:iw/2:0[two]"
+else
+  _EYES="[a]crop=iw/2:ih:iw/2:0[one];[b]crop=iw/2:ih:0:0[two]"
+fi
+case "$LAYOUT" in
+  fsbs) if [[ $SWAPEYES -eq 1 ]]; then
+          VF="split=2[a][b];${_EYES};[one][two]hstack=inputs=2"
+        else
+          VF=""      # already in this order, so no filter at all
+        fi ;;
+  hsbs) if [[ $SWAPEYES -eq 1 ]]; then
+          VF="split=2[a][b];${_EYES};[one][two]hstack=inputs=2,scale=iw/2:ih:flags=lanczos"
+        else
+          VF="scale=iw/2:ih:flags=lanczos"
+        fi ;;
+  ftab) VF="split=2[a][b];${_EYES};[one][two]vstack=inputs=2" ;;
+  htab) VF="split=2[a][b];${_EYES};[one][two]vstack=inputs=2,scale=iw:ih/2:flags=lanczos" ;;
+esac
+[[ $SWAPEYES -eq 1 ]] && say "Eyes swapped: the frame is rebuilt with the right eye first"
+
+case "$LAYOUT" in
+  # Left-eye-first regardless: with --swap-eyes the eyes have been physically
+  # reordered, so the frame genuinely is in this order by the time it is tagged.
+  fsbs|hsbs) STEREO_MODE=1 ;;   # side by side, left eye first
+  ftab|htab) STEREO_MODE=3 ;;   # top-bottom, left eye first
+esac
+
+# ------------------------------- encode ------------------------------------
+ENC=(-c:v libx264 -preset "$PRESET" -crf "$CRF")
+case "$VCODEC" in
+  x265) ENC=(-c:v libx265 -preset "$PRESET" -crf "$CRF") ;;
+  vt)   ENC=(-c:v hevc_videotoolbox -q:v "$VTQUALITY" -tag:v hvc1) ;;
+esac
+
+# aq-mode 3 biases bit allocation towards dark regions, which is exactly where
+# banding shows up. Cheap, and it does not change the profile.
+if [[ $DARK -eq 1 ]]; then
+  case "$VCODEC" in
+    # sao=0 is the measured win on x265: on a dithered dark ramp it retained
+    # 56% of the source dither against 52% for defaults, and produced a
+    # smaller file doing it. SAO is a smoothing post-filter and dither is
+    # exactly what it smooths away.
+    #
+    # strong-intra-smoothing=0 used to be set here on the strength of received
+    # wisdom that it causes gradient banding. Measured, it retained 47%, worse
+    # than leaving it alone, so it is gone.
+    #
+    # aq-mode=3 is kept for bit distribution across mixed frames, which is what
+    # it is for. The dark-ramp test cannot evaluate it: with no bright regions
+    # in the frame there is nothing for it to take bits from.
+    x265) ENC+=(-x265-params "aq-mode=3:sao=0") ;;
+    vt)   warn "--dark does nothing with VideoToolbox" ;;
+    *)    ENC+=(-x264-params "aq-mode=3:dct-decimate=0") ;;
+  esac
+fi
+
+PIXFMT=yuv420p
+TENBIT_PREFILTER=""
+if [[ $TENBIT -eq 1 ]]; then
+  case "$VCODEC" in
+    # The Apple Silicon media engine encodes 10-bit HEVC, but wants p010
+    # rather than the planar 10-bit format the software encoders take.
+    # Some FFmpeg builds have no direct yuv420p to p010le path and route the
+    # conversion through 16-bit RGB, which is a full colour round trip. Going
+    # via planar 10-bit first is a plain bit-depth increase instead.
+    vt)   PIXFMT=p010le; TENBIT_PREFILTER="format=yuv420p10le" ;;
+    x265) PIXFMT=yuv420p10le ;;
+    *)    PIXFMT=yuv420p10le; ENC+=(-profile:v high10) ;;
+  esac
+fi
+# VBV. CRF is a quality target with no rate ceiling, so peaks are unbounded.
+# A buffer of twice the rate is the usual compromise: enough to let a hard
+# scene borrow, tight enough that the player never has to sustain more.
+if [[ -n "$MAXRATE" ]]; then
+  [[ "$MAXRATE" =~ ^[0-9]+$ ]] || die "--maxrate wants a whole number of Mbps"
+  case "$VCODEC" in
+    vt) warn "--maxrate does nothing with VideoToolbox" ;;
+    *)  ENC+=(-maxrate "${MAXRATE}M" -bufsize "$((MAXRATE * 2))M")
+        say "Peak bitrate capped at ${MAXRATE} Mbps" ;;
+  esac
+fi
+[[ -n "$THREADS" ]] && ENC+=(-threads "$THREADS")
+
+MAPS=(-map 0:v:0)
+if [[ $NOAUDIO -eq 0 ]]; then
+  if [[ -n "$ATRACKS" ]]; then
+    for _t in ${ATRACKS//,/ }; do MAPS+=(-map "1:a:${_t}?"); done
+  else
+    MAPS+=(-map "1:a?")
+  fi
+fi
+SUBIN=(); SUBMETA=()
+if [[ $SUB3D -eq 1 ]]; then
+  # Inputs 0 and 1 are the decoder pipe and the source, so the rebuilt
+  # subtitle files start at input 2.
+  # FFmpeg rebases every input file so that its own first timestamp becomes
+  # zero. A .sup whose first subtitle is 44 seconds in therefore lands at 0,
+  # and the whole track runs 44 seconds early for the length of the film.
+  # -itsoffset puts back exactly what is about to be subtracted. Measured:
+  # a synthetic .sup starting at 44s muxed to 0.000, and to 44.000 with this.
+  for ((_k = 0; _k < ${#SUB_IDX[@]}; _k++)); do
+    SUP_START="$(ffprobe -v error -show_entries format=start_time \
+                 -of default=nw=1:nk=1 "${SUP_3D[$_k]}" 2>/dev/null || true)"
+    case "$SUP_START" in
+      ''|N/A|0|0.0|0.000000|-*) SUP_START="" ;;
+    esac
+    if [[ -n "$SUP_START" ]]; then
+      say "Subtitle track ${SUB_IDX[$_k]} starts at ${SUP_START}s, holding it there"
+      SUBIN+=(-itsoffset "$SUP_START")
+    fi
+    SUBIN+=(-f sup -i "${SUP_3D[$_k]}")
+    MAPS+=(-map "$((2 + _k)):s:0")
+    SUBMETA+=("-metadata:s:s:${_k}" "language=${SUB_LANG[$_k]}")
+  done
+elif [[ $NOSUBS -eq 0 ]]; then
+  if [[ -n "$STRACKS" ]]; then
+    for _t in ${STRACKS//,/ }; do MAPS+=(-map "1:s:${_t}?"); done
+  else
+    MAPS+=(-map "1:s?")
+  fi
+fi
+
+FF=(ffmpeg -hide_banner -loglevel warning -stats -y)
+if [[ -n "$PROGRESS" ]]; then
+  : > "$PROGRESS"
+  FF+=(-progress "$PROGRESS" -stats_period 1)
+  mach "@@progressfile $PROGRESS"
+fi
+# No -ss on the decoder pipe: the extraction has already seeked.
+FF+=(-thread_queue_size 1024 -f yuv4mpegpipe -i -)
+[[ -n "$START" ]] && FF+=(-ss "$START")
+# PGS subtitles appear sparsely, so the default 5 MB probe often fails to find
+# their resolution ("unspecified size"). Give the demuxer room to look.
+FF+=(-probesize 200M -analyzeduration 200M -i "$IN")
+FF+=(${SUBIN[@]+"${SUBIN[@]}"})
+FF+=("${MAPS[@]}")
+if [[ -n "$TENBIT_PREFILTER" ]]; then
+  VF="${VF:+$VF,}$TENBIT_PREFILTER"
+fi
+# setparams goes first, before any crop, stack or format change.
+VF="${SETPARAMS}${VF:+,$VF}"
+[[ -n "$VF" ]] && FF+=(-vf "$VF")
+FF+=("${ENC[@]}")
+FF+=(-pix_fmt "$PIXFMT"
+     -color_primaries bt709 -color_trc bt709 -colorspace bt709 -color_range tv
+     -c:a copy -c:s copy)
+# Chapters describe the whole film. Copying them into a --limit or --start
+# excerpt leaves nearly every chapter pointing past the end of the file, which
+# some players reject outright.
+# FFmpeg never writes the chapters. See the transfer step after the mux for
+# why. Excerpt runs get none at all, since every chapter would point past the
+# end of a 60 second file.
+FF+=(-map_chapters -1)
+TRANSFER_CHAPTERS=1
+if [[ $NOCHAPTERS -eq 1 ]]; then
+  TRANSFER_CHAPTERS=0
+  say "Chapters dropped at your request"
+elif [[ -n "$LIMIT" || -n "$START" ]]; then
+  TRANSFER_CHAPTERS=0
+  say "Excerpt run, so chapters are dropped rather than left pointing past the end"
+fi
+FF+=(${SUBMETA[@]+"${SUBMETA[@]}"})
+[[ -n "$LIMIT" ]] && FF+=(-t "$LIMIT")
+# shellcheck disable=SC2206
+[[ -n "$EXTRA" ]] && FF+=($EXTRA)
+# FFmpeg writes a staging file and MKVToolNix produces the output proper. See
+# the remux step after the encode for why.
+#
+# The staging file goes in the scratch directory, not beside the output. Writing
+# it beside the output puts a full-size intermediate on the destination, which
+# on a NAS means the whole encode crosses the network and then crosses it again
+# to be read back for the remux. Scratch is already chosen to be local storage.
+# Only the finished file should ever land at the destination.
+STAGE="$OUT"
+REMUX=0
+if command -v mkvmerge >/dev/null 2>&1; then
+  STAGE="${TMPROOT}/${INBASE}.ffmpeg.mkv"
+  REMUX=1
+fi
+FF+=("$STAGE")
+
+if [[ $DRYRUN -eq 1 ]]; then
+  printf 'edge264_test %q %s | ' "$H264" "$EDGE_FLAGS"
+  printf '%q ' "${FF[@]}"; echo
+  exit 0
+fi
+
+mach "@@stage encode"
+if [[ "$VCODEC" == "vt" ]]; then
+  say "Encoding -> $(basename "$OUT")   [$LAYOUT, VideoToolbox HEVC, quality $VTQUALITY]"
+else
+  say "Encoding -> $(basename "$OUT")   [$LAYOUT, $VCODEC, CRF $CRF, preset $PRESET]"
+fi
+START_TS=$(date +%s)
+
+# The decoder is killed by SIGPIPE (141) whenever ffmpeg stops first, which is
+# normal for --limit runs and can race at end of stream. Judge success on the
+# encoder's exit status, not the pipeline's.
+DECRC_FILE="$(mktemp "${TMPDIR:-/tmp}/mvc2sbs.decrc.XXXXXX")"
+set +e +o pipefail
+{ edge264_test "$H264" "$EDGE_FLAGS" 2>/dev/null; echo $? > "$DECRC_FILE"; } | "${FF[@]}" &
+PIPE_PID=$!
+wait "$PIPE_PID"
+ENC_RC=$?
+set -e -o pipefail
+DEC_RC="$(cat "$DECRC_FILE" 2>/dev/null || echo 0)"
+rm -f "$DECRC_FILE"
+echo >&2
+
+[[ "$ENC_RC" -eq 0 ]] || die "encode failed, ffmpeg exited $ENC_RC"
+if [[ "$DEC_RC" -ne 0 && "$DEC_RC" -ne 141 ]]; then
+  warn "edge264_test exited $DEC_RC. If the output is short or truncated, retry
+      with MVC2SBS_SINGLE_THREAD=1 to use the slower but more tolerant decoder."
+fi
+
+# The elementary stream is finished with the moment the encode ends, and it is
+# roughly the size of the source. Deleting it at the end of the run instead of
+# here meant the volume had to hold the source's worth of H.264, the staging
+# encode and the finished file all at once: about 100 GB for a 45 GB rip.
+if [[ $KEEP -eq 0 && -f "$H264" ]]; then
+  say "Freeing the elementary stream ($(du -h "$H264" 2>/dev/null | awk '{print $1}'))"
+  rm -f "$H264"
+fi
+
+# ------------------------------- remux -------------------------------------
+# The final file is written by MKVToolNix, not FFmpeg.
+#
+# Both produce a valid Matroska file with identical streams, and every field
+# mkvdiff checks agrees between them. Jellyfin's Android TV client on an Nvidia
+# Shield nonetheless refuses to direct play FFmpeg's, and plays MKVToolNix's.
+# Measured by remuxing one file with `mkvmerge -o new.mkv old.mkv`, changing
+# nothing else, and watching it start. BD3D2MK3D has always muxed with
+# mkvmerge, which is why files from it have never shown this.
+#
+# Chapters come across here too. FFmpeg writes a ChapterTimeEnd on every
+# chapter, which Matroska only defines for ordered editions; players that read
+# it as one build a broken timeline and show no picture until the first chapter
+# boundary. mkvmerge omits the element.
+if [[ $REMUX -eq 1 ]]; then
+  mach "@@stage remux"
+  MKVM=(mkvmerge -q -o "$OUT")
+
+  # Stamp what made this file into the file. The tag names are deliberately
+  # prefixed: a tag called ENCODER is overwritten by the muxer's own writing
+  # app by the time anything reads it back.
+  # Stamp what made this file into the file. Working out after the fact which
+  # build and which settings produced a given output, from a folder full of
+  # them, is otherwise guesswork, and guessing wrong sends you chasing faults
+  # that were fixed two versions ago.
+  TAGXML="$(mktemp "${TMPDIR:-/tmp}/mvc2sbs.tags.XXXXXX")"
+  SETTINGS="$LAYOUT $VCODEC"
+  if [[ "$VCODEC" == "vt" ]]; then
+    SETTINGS="$SETTINGS q$VTQUALITY"
+  else
+    SETTINGS="$SETTINGS crf$CRF $PRESET"
+  fi
+  [[ $TENBIT -eq 1 ]] && SETTINGS="$SETTINGS 10bit"
+  [[ $SWAPEYES -eq 1 ]] && SETTINGS="$SETTINGS swapeyes"
+  [[ $DARK -eq 1 ]] && SETTINGS="$SETTINGS dark"
+  [[ -n "$MAXRATE" ]] && SETTINGS="$SETTINGS maxrate${MAXRATE}M"
+  [[ $SUB3D -eq 1 ]] && SETTINGS="$SETTINGS subs3d(depth${SUBDEPTH},bright${SUBBRIGHT},$SUBCOLOUR)"
+  [[ $FLATSUBS -eq 1 ]] && SETTINGS="$SETTINGS flatsubs"
+  [[ $NOSUBS -eq 1 ]] && SETTINGS="$SETTINGS nosubs"
+  cat > "$TAGXML" <<EOF
+<?xml version="1.0"?>
+<Tags>
+  <Tag>
+    <Targets/>
+    <Simple><Name>MVC2SBS_VERSION</Name><String>$VERSION</String></Simple>
+    <Simple><Name>MVC2SBS_SETTINGS</Name><String>$SETTINGS</String></Simple>
+  </Tag>
+</Tags>
+EOF
+  MKVM+=(--global-tags "$TAGXML")
+
+  CHAPXML=""
+  if [[ $TRANSFER_CHAPTERS -eq 1 ]]; then
+    CHAPXML="$(mktemp "${TMPDIR:-/tmp}/mvc2sbs.chapters.XXXXXX")"
+    if mkvextract "$IN" chapters > "$CHAPXML" 2>/dev/null && [[ -s "$CHAPXML" ]]; then
+      python3 - "$CHAPXML" <<'PYEOF'
+import re, sys
+p = sys.argv[1]
+x = open(p, encoding="utf-8").read()
+open(p, "w", encoding="utf-8").write(
+    re.sub(r"\s*<ChapterTimeEnd>[^<]*</ChapterTimeEnd>", "", x))
+PYEOF
+      MKVM+=(--chapters "$CHAPXML")
+      NCHAP="$(grep -c '<ChapterAtom>' "$CHAPXML" || true)"
+      say "Carrying ${NCHAP:-0} chapters across from the source"
+    else
+      rm -f "$CHAPXML"; CHAPXML=""
+      MKVM+=(--no-chapters)
+    fi
+  else
+    MKVM+=(--no-chapters)
+  fi
+
+  MKVM+=("$STAGE")
+
+  # The remux writes a second copy of the whole film before the first can be
+  # deleted. On a volume that also held the elementary stream this has run out
+  # of space mid-write, and mkvmerge's complaint went nowhere because its output
+  # was never captured.
+  STAGE_KB="$(( $(stat -f%z "$STAGE" 2>/dev/null || stat -c%s "$STAGE") / 1024 ))"
+  OUT_AVAIL_KB="$(df -Pk "$OUTDIR" | tail -1 | awk '{print $4}')"
+  if [[ "$OUT_AVAIL_KB" -lt $((STAGE_KB + 1048576)) ]]; then
+    warn "$((OUT_AVAIL_KB/1024/1024)) GB free where the output goes, and the
+      remux needs about $((STAGE_KB/1024/1024)) GB. Free some space now: the
+      encode is finished and safe in $(basename "$STAGE"), and mkvmerge will be
+      run on it either way."
+  fi
+
+  say "Remuxing with mkvmerge. Nothing is re-encoded, but the file is rewritten."
+  MKVLOG="$(mktemp "${TMPDIR:-/tmp}/mvc2sbs.mkvmerge.XXXXXX")"
+  MKVRC=0
+  run_interruptible "${MKVM[@]}" >"$MKVLOG" 2>&1 || MKVRC=$?
+
+  # mkvmerge returns 1 when it had something to say and 2 when it failed. Every
+  # earlier version treated 1 as failure, threw away a perfectly good file and
+  # kept FFmpeg's instead, which is the mux that does not direct play.
+  if [[ $MKVRC -eq 1 ]] && [[ -s "$OUT" ]]; then
+    warn "mkvmerge reported warnings. The file is fine; this is what it said:"
+    sed 's/^/      /' "$MKVLOG" >&2
+    MKVRC=0
+  fi
+
+  if [[ $MKVRC -eq 0 && -s "$OUT" ]]; then
+    rm -f "$STAGE"
+    mach "@@remux ok"
+  else
+    # A failed remux must not lose three hours of encoding.
+    [[ -s "$MKVLOG" ]] && { warn "mkvmerge said:"; sed 's/^/      /' "$MKVLOG" >&2; }
+    [[ -f "$OUT" && ! -s "$OUT" ]] && rm -f "$OUT"
+    warn "mkvmerge exited $MKVRC. Keeping FFmpeg's file, which plays in software
+      players but may be refused by a set-top client. Nothing is lost and
+      nothing needs re-encoding. Fix whatever it complained about, then:
+        mkvdiff --repair \"$OUT\" --chapters-from \"$IN\""
+    mv -f "$STAGE" "$OUT"
+    mach "@@remux failed"
+  fi
+  rm -f "$MKVLOG"
+  [[ -n "$CHAPXML" ]] && rm -f "$CHAPXML"
+  rm -f "$TAGXML"
+else
+  warn "mkvmerge not found, so FFmpeg wrote the output directly and it carries
+      no chapters. That file plays in software players but Jellyfin on a Shield
+      refuses FFmpeg-muxed files. Install mkvtoolnix: brew install mkvtoolnix"
+fi
+
+ELAPSED=$(( $(date +%s) - START_TS ))
+say "Encode finished in $((ELAPSED/60))m $((ELAPSED%60))s"
+
+# --------------------------- length verification ---------------------------
+# A dropped or duplicated frame anywhere in the decode would put the video out
+# of sync with the copied audio, and you do not want to find that out after
+# three hours. Compare source and output video duration.
+if [[ -z "$LIMIT" && -z "$START" ]]; then
+  dur() {  # $1 = file, $2 = stream selector
+    local d
+    d="$(ffprobe -v error -select_streams "$2" -show_entries stream=duration \
+         -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1 | tr -d '[:space:],')"
+    [[ "$d" =~ ^[0-9.]+$ ]] || d="$(ffprobe -v error -show_entries format=duration \
+         -of default=nw=1:nk=1 "$1" 2>/dev/null | head -1 | tr -d '[:space:],')"
+    echo "$d"
+  }
+  SRC_DUR="$(dur "$IN" "v:$VTRACK")"
+  OUT_DUR="$(dur "$OUT" "v:0")"
+  if [[ "$SRC_DUR" =~ ^[0-9.]+$ && "$OUT_DUR" =~ ^[0-9.]+$ ]]; then
+    VERDICT="$(python3 -c '
+import sys
+a, b = float(sys.argv[1]), float(sys.argv[2])
+d = b - a
+print("%.2f %.2f %+.2f %s" % (a, b, d, "ok" if abs(d) <= 1.0 else "drift"))
+' "$SRC_DUR" "$OUT_DUR")"
+    read -r _s _o _d _v <<<"$VERDICT"
+    if [[ "$_v" == "ok" ]]; then
+      mach "@@length ok ${_s} ${_o} ${_d}"
+      say "Length check: source ${_s}s, output ${_o}s (${_d}s). Audio sync is good."
+    else
+      mach "@@length drift ${_s} ${_o} ${_d}"
+      warn "Length check: source ${_s}s but output ${_o}s (${_d}s). The video is
+      not the same length as the source, so the copied audio will drift.
+      Do not keep this file without checking sync."
+    fi
+  else
+    warn "could not compare source and output duration"
+  fi
+fi
+
+# --------------------------- playability check -----------------------------
+# Length and duration can both be right on a file that will not start. Two
+# faults look identical to a viewer, black picture with working sound, and
+# neither shows up in a duration comparison:
+#   1. an interrupted mux, which leaves no Cues index
+#   2. video that does not decode from the head of the file
+# Decode the first three seconds and count what comes out.
+mach "@@stage verify"
+START_FRAMES="$(ffmpeg -v error -stats -nostdin -i "$OUT" -map 0:v:0 -t 3 \
+  -f null - 2>&1 | tr '\r' '\n' | grep -o 'frame= *[0-9]*' | tail -1 \
+  | tr -dc '0-9' || true)"
+START_FRAMES="${START_FRAMES:-0}"
+if [[ "$START_FRAMES" -lt 10 ]]; then
+  mach "@@startup bad $START_FRAMES"
+  warn "Playability check: only $START_FRAMES video frames decoded from the first
+      three seconds. Sound will play and the picture will stay black until the
+      player stumbles onto a later keyframe. This output is not usable.
+      Re-run the encode. If it was interrupted, that is the cause."
+else
+  mach "@@startup ok $START_FRAMES"
+  say "Playability check: $START_FRAMES frames decoded from the first three seconds"
+fi
+
+# A mux that never finished writing has no Cues index. VLC seeks by scanning
+# and limps along; hardware players show black. mkvinfo would answer this but
+# it walks every cluster, so on a feature film it reads the whole file again.
+# The Cues element sits after the last cluster, so read the tail and stop.
+CUES="$(python3 - "$OUT" <<'PYEOF' || true
+import os, sys
+# 1C53BB6B is the Cues element. The SeekHead names it too, inside a SeekID
+# element, which on the wire is 53 AB 84 followed by those four bytes. A match
+# preceded by 53 AB 84 is only a reference. mkvmerge writes Cues near the front
+# and FFmpeg writes them at the end, so both ends have to be read.
+CUES = b"\x1c\x53\xbb\x6b"
+REF = b"\x53\xab\x84" + CUES
+
+def scan(buf):
+    seen_ref = False
+    i = buf.find(CUES)
+    while i != -1:
+        if i >= 3 and buf[i - 3:i + 4] == REF:
+            seen_ref = True
+        else:
+            return True, seen_ref
+        i = buf.find(CUES, i + 1)
+    return False, seen_ref
+
+p = sys.argv[1]
+try:
+    size = os.path.getsize(p)
+    ref = False
+    with open(p, "rb") as fh:
+        present, r = scan(fh.read(16 << 20)); ref = ref or r
+        if not present and size > (16 << 20):
+            fh.seek(max(0, size - (16 << 20)))
+            present, r = scan(fh.read(16 << 20)); ref = ref or r
+    print("ok" if present else ("dangling" if ref else "missing"))
+except Exception:
+    print("unknown")
+PYEOF
+)"
+case "${CUES:-unknown}" in
+  ok)      mach "@@cues ok" ;;
+  unknown) ;;
+  *)       mach "@@cues missing"
+           warn "Playability check: the output has no Cues index, so the mux never
+      finished writing. A player will give you sound over a black picture.
+      Re-run the encode." ;;
+esac
+
+# ---------------------------- eye order ------------------------------------
+# Two seconds at the end of an encode that took an hour, to catch the one fault
+# nothing else here can see: a film whose depth reads inverted plays perfectly,
+# passes every other check, and is merely uncomfortable to watch.
+#
+# Reported, not corrected. The estimate is a heuristic about how a scene was
+# composed, and silently inverting a film that was right is worse than leaving
+# one that is wrong, because you would have no reason to look.
+if [[ "$LAYOUT" == "fsbs" || "$LAYOUT" == "hsbs" ]] && command -v mkvdiff >/dev/null 2>&1; then
+  mach "@@stage eyes"
+  EYES="$(mkvdiff --eyes-brief "$OUT" 2>/dev/null | tail -1 || true)"
+  read -r _ev _em <<<"${EYES:-}" || true
+  case "${_ev:-}" in
+    ok)
+      mach "@@eyes ok ${_em}"
+      say "Eye order: reads correctly (disparity ${_em} px)" ;;
+    inverted)
+      mach "@@eyes inverted ${_em}"
+      warn "Eye order: depth reads inverted (disparity ${_em} px). Most of the
+      frame measures as being in front of the screen, which is unusual in a
+      film. Nothing is wrong with the picture and it will play normally, but it
+      may be uncomfortable to watch. Fix without re-encoding:
+        mkvpropedit \"$OUT\" --edit track:v1 --set stereo-mode=11
+      Then check it on your own display: this is an estimate, not a certainty." ;;
+    *)
+      mach "@@eyes unknown"
+      say "Eye order: not enough matchable detail to judge" ;;
+  esac
+fi
+
+# -------------------------- subtitle sync ----------------------------------
+# The rebuilt subtitle files carry their own timestamps, and a mux that rebases
+# them to zero produces a track that is early by the length of the film's cold
+# open. Nothing about the file looks wrong, and you find out when you watch it.
+if [[ $SUB3D -eq 1 && ${#SUP_3D[@]} -gt 0 && -s "${SUP_3D[0]}" ]]; then
+  _ss="$(ffprobe -v error -select_streams s:0 -show_entries packet=pts_time \
+         -read_intervals '%+#1' -of default=nw=1:nk=1 "${SUP_3D[0]}" 2>/dev/null | head -1)"
+  _os="$(ffprobe -v error -select_streams s:0 -show_entries packet=pts_time \
+         -read_intervals '%+#1' -of default=nw=1:nk=1 "$OUT" 2>/dev/null | head -1)"
+  if [[ -n "$_ss" && -n "$_os" ]]; then
+    _sd="$(python3 -c "print('%.2f' % abs(float('$_os') - float('$_ss')))" 2>/dev/null || echo 0)"
+    if python3 -c "import sys; sys.exit(0 if float('$_sd') > 1 else 1)" 2>/dev/null; then
+      mach "@@subsync drift ${_ss} ${_os} ${_sd}"
+      warn "Subtitle check: the first subtitle is at ${_os}s in the output but
+      ${_ss}s in the rebuilt track, a drift of ${_sd}s. The whole track is
+      offset. Re-run; if it persists, report it."
+    else
+      mach "@@subsync ok ${_ss} ${_os}"
+      say "Subtitle check: first subtitle at ${_os}s, matching the source"
+    fi
+  fi
+fi
+
+# --------------------------- chapter sanity --------------------------------
+# A chapter whose end time is past the end of the file is not a cosmetic fault.
+# Some players, the Nvidia Shield among them, respond by showing a black screen
+# and playing no audio at all, which looks exactly like a broken encode.
+if [[ $NOCHAPTERS -eq 0 ]]; then
+  CHAP_VERDICT="$(ffprobe -v error -show_chapters -show_entries format=duration \
+    -of json "$OUT" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+ch = d.get("chapters", [])
+if not ch:
+    sys.exit(0)
+try:
+    dur = float(d["format"]["duration"])
+    last = max(float(c.get("end_time", 0)) for c in ch)
+except Exception:
+    sys.exit(0)
+if last > dur + 1:
+    print("bad %d %.2f %.2f" % (len(ch), last, dur))
+else:
+    print("ok %d %.2f %.2f" % (len(ch), last, dur))
+' || true)"
+  read -r _cv _cn _cl _cd <<<"${CHAP_VERDICT:-}" || true
+  if [[ "${_cv:-}" == "bad" ]]; then
+    mach "@@chapters bad ${_cn} ${_cl} ${_cd}"
+    warn "Chapter check: the last of ${_cn} chapters ends at ${_cl}s but the file
+      is only ${_cd}s long. Players that reject this show a black screen and
+      play no audio. Fix the finished file in place, no re-encode needed:
+        mkvpropedit \"$OUT\" --chapters ''
+      Or re-run with --no-chapters."
+  elif [[ "${_cv:-}" == "ok" ]]; then
+    mach "@@chapters ok ${_cn} ${_cl} ${_cd}"
+    say "Chapter check: ${_cn} chapters, last ends at ${_cl}s of ${_cd}s"
+  fi
+fi
+
+# ------------------------------- tag ---------------------------------------
+if command -v mkvpropedit >/dev/null 2>&1; then
+  mach "@@stage mux"
+  # Display dimensions describe the whole 3D image with both eyes at full
+  # resolution, not one eye.
+  #
+  # Reading the spec, DisplayWidth/DisplayHeight describe a single eye when
+  # StereoMode is set, so a 3840x1080 side-by-side frame would carry 1920x1080.
+  # That is the same 16:9 ratio as the value below and it looks equally correct
+  # on paper. It is not: a file written that way is refused outright by Jellyfin
+  # on an Nvidia Shield, which will not start playback at any position. The same
+  # file with 3840x2160 plays. BD3D2MK3D, which has worked on that hardware for
+  # years, writes 3840x2160.
+  #
+  # The ratio is identical either way, so what matters is the absolute size.
+  # Declaring a display smaller than the coded frame reads as "this needs
+  # scaling down" and a server can decide against direct play on that basis.
+  # Never publish display dimensions below the pixel dimensions.
+  case "$LAYOUT" in
+    # Full layouts: both eyes at full resolution, so the 3D image is twice the
+    # source in the packing direction and twice in the other.
+    fsbs|ftab) DISP_W=$((SRC_W * 2)); DISP_H=$((SRC_H * 2)) ;;
+    # Half layouts: each eye is squeezed to half and stretches back out, so the
+    # 3D image is exactly the source size and equals the coded frame.
+    *)         DISP_W="$SRC_W";       DISP_H="$SRC_H" ;;
+  esac
+  # interlaced=2 means progressive. mkvmerge writes the flag as undetermined,
+  # and for HEVC there is nothing in the bitstream for a reader to fall back on,
+  # so ffprobe reports field_order as unknown. FFmpeg's own muxer wrote
+  # progressive, so moving the mux to MKVToolNix lost it. The decoder cannot
+  # produce anything but progressive frames, since edge264 does not support
+  # interlaced sources at all, so this is safe to state outright.
+  say "Setting StereoMode=$STEREO_MODE, display size ${DISP_W}x${DISP_H}, progressive"
+  mkvpropedit "$OUT" --edit track:v1 \
+    --set "stereo-mode=$STEREO_MODE" \
+    --set "display-width=$DISP_W" \
+    --set "display-height=$DISP_H" \
+    --set "interlaced=2" >/dev/null
+fi
+
+# ------------------------------- cleanup -----------------------------------
+if [[ $KEEP -eq 0 ]]; then
+  rm -f "$H264"
+else
+  say "Kept intermediate: $H264"
+fi
+
+mach "@@done $OUT"
+say "Done: $OUT"
+[[ -n "${LOGFILE:-}" ]] && say "Log: $LOGFILE"
+ls -lh "$OUT" >&2

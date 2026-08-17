@@ -1,0 +1,1068 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Alan Wild
+# ---------------------------------------------------------------------------
+# mkvdiff - dump the fields a hardware player actually cares about, for one or
+#           two MKVs. Point it at a file that plays and a file that does not.
+#
+#   mkvdiff good.mkv [bad.mkv]
+#
+# Prints profile, level, resolution, pixel format, colour tags, Matroska
+# StereoMode, display dimensions, chapter span and track layout. When given two
+# files it marks every field that differs, which is usually where the fault is.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+VERSION="3.61"
+
+TMPDIR_ERR="$(mktemp "${TMPDIR:-/tmp}/mkvdiff.err.XXXXXX")"
+trap 'rm -f "$TMPDIR_ERR"' EXIT
+
+say()  { printf '\033[1;36m==>\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+
+command -v ffprobe >/dev/null 2>&1 || { echo "ffprobe not found" >&2; exit 1; }
+
+dump() {  # $1 = file
+  local f="$1"
+  python3 - "$f" <<'PY'
+import json, subprocess, sys, os
+
+path = sys.argv[1]
+
+def run(args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True).stdout
+    except FileNotFoundError:
+        return ""
+
+probe = json.loads(run(["ffprobe", "-v", "error", "-show_streams", "-show_format",
+                        "-show_chapters", "-of", "json",
+                        "-probesize", "200M", "-analyzeduration", "200M", path]) or "{}")
+
+out = {}
+streams = probe.get("streams", [])
+v = next((s for s in streams if s.get("codec_type") == "video"), {})
+
+out["file"]           = os.path.basename(path)
+# Provenance, if mvc2sbs wrote it. Knowing which build and which settings made a
+# file is the difference between a comparison and a guess.
+_ftags = probe.get("format", {}).get("tags", {}) or {}
+_enc = None
+for _tk, _tv in _ftags.items():          # not k, v: v is the video stream below
+    if _tk.upper() == "MVC2SBS_VERSION":
+        _enc = "mvc2sbs " + str(_tv)
+    if _tk.upper() == "MVC2SBS_SETTINGS":
+        out["mvc2sbs.settings"] = str(_tv)
+out["mvc2sbs.version"] = _enc or "not stamped"
+out["container_dur"]  = probe.get("format", {}).get("duration", "?")
+out["v.codec"]        = v.get("codec_name", "?")
+out["v.profile"]      = v.get("profile", "?")
+out["v.level"]        = str(v.get("level", "?"))
+out["v.size"]         = f"{v.get('width','?')}x{v.get('height','?')}"
+out["v.pix_fmt"]      = v.get("pix_fmt", "?")
+out["v.color_range"]  = v.get("color_range", "unset")
+out["v.color_space"]  = v.get("color_space", "unset")
+out["v.color_prim"]   = v.get("color_primaries", "unset")
+out["v.color_trc"]    = v.get("color_transfer", "unset")
+out["v.fps"]          = v.get("r_frame_rate", "?")
+out["v.sar"]          = v.get("sample_aspect_ratio", "unset")
+out["v.dar"]          = v.get("display_aspect_ratio", "unset")
+out["v.field_order"]  = v.get("field_order", "unset")
+out["v.refs"]         = str(v.get("refs", "?"))
+out["v.bit_depth"]    = str(v.get("bits_per_raw_sample", "?"))
+out["v.bit_rate"]     = v.get("bit_rate", "unset")
+
+size = os.path.getsize(path)
+out["file_size"] = "%.2f GB" % (size / 1e9)
+try:
+    out["avg_bitrate"] = "%.1f Mbps" % (size * 8 / float(out["container_dur"]) / 1e6)
+except Exception:
+    out["avg_bitrate"] = "?"
+
+out["audio_tracks"]   = str(sum(1 for s in streams if s.get("codec_type") == "audio"))
+out["sub_tracks"]     = str(sum(1 for s in streams if s.get("codec_type") == "subtitle"))
+
+# Audio codecs by name. A lossless track a client cannot pass through is a
+# common reason a server refuses Direct Play on an otherwise fine file.
+for i, a in enumerate([s for s in streams if s.get("codec_type") == "audio"]):
+    name = a.get("codec_name", "?")
+    prof = a.get("profile", "")
+    out["a%d" % i] = "%s%s %sch %s" % (
+        name, (" " + prof) if prof else "",
+        a.get("channels", "?"), a.get("tags", {}).get("language", "und"))
+
+sub = next((s for s in streams if s.get("codec_type") == "subtitle"), None)
+out["sub.size"] = f"{sub.get('width','?')}x{sub.get('height','?')}" if sub else "n/a"
+
+chapters = probe.get("chapters", [])
+out["chapters"] = str(len(chapters))
+if chapters:
+    try:
+        last = max(float(c.get("end_time", 0)) for c in chapters)
+        dur = float(out["container_dur"])
+        out["chapters_past_end"] = "YES" if last > dur + 1 else "no"
+    except Exception:
+        out["chapters_past_end"] = "?"
+else:
+    out["chapters_past_end"] = "no"
+
+# FFmpeg writes a ChapterTimeEnd on every chapter. Matroska only gives that
+# element meaning for ordered editions, where the player builds a virtual
+# timeline from the chapter ranges rather than playing straight through.
+# Players that take the hint mis-time or refuse the file. MKVToolNix omits it.
+if chapters:
+    ch_xml = run(["mkvextract", path, "chapters"])
+    if ch_xml:
+        out["chapters_ordered_hint"] = "YES" if "<ChapterTimeEnd>" in ch_xml else "no"
+    else:
+        out["chapters_ordered_hint"] = "?"
+else:
+    out["chapters_ordered_hint"] = "n/a"
+
+# Matroska specific: StereoMode and display dimensions live outside FFmpeg's
+# stream view, so ask mkvmerge when it is available.
+mkv = run(["mkvmerge", "-J", path])
+if mkv:
+    try:
+        d = json.loads(mkv)
+        vt = next((t for t in d.get("tracks", []) if t.get("type") == "video"), {})
+        p = vt.get("properties", {})
+        out["mkv.codec_id"]      = p.get("codec_id", "?")
+        out["mkv.stereo_mode"]   = str(p.get("stereo_mode", "unset"))
+        out["mkv.pixel_dims"]    = p.get("pixel_dimensions", "?")
+        out["mkv.display_dims"]  = p.get("display_dimensions", "unset")
+        out["mkv.default_dur"]   = str(p.get("default_duration", "unset"))
+    except Exception:
+        pass
+    try:
+        d = json.loads(mkv)
+        c = d.get("container", {}).get("properties", {})
+        out["mkv.writing_app"] = c.get("writing_application", "unset")
+        out["mkv.muxing_app"]  = c.get("muxing_application", "unset")
+        out["mkv.duration_ns"] = str(c.get("duration", "unset"))
+    except Exception:
+        pass
+else:
+    out["mkv.stereo_mode"] = "(mkvmerge not installed)"
+
+# An interrupted mux leaves no Cues index. VLC seeks by scanning and plays it
+# anyway; hardware players that rely on the index show a black screen.
+# Cues, the seek index. A mux that never finished writing has none, and the
+# result is a file that plays sound with a black picture until the player
+# stumbles onto a keyframe.
+#
+# mkvinfo -v would answer this but it walks every cluster, so on a feature film
+# it reads the whole file. Over a network share that is minutes. Read the two
+# places the answer can be instead: the SeekHead near the start references the
+# Cues element by ID, and the Cues element itself sits at one end or the other.
+def has_cues(p):
+    # 1C53BB6B is the Cues element. The SeekHead also names it, inside a SeekID
+    # element, which on the wire is 53 AB 84 followed by the four ID bytes. So a
+    # match preceded by 53 AB 84 is only a reference; any other match is the
+    # element itself. Without that distinction every mkvmerge file looks broken,
+    # because mkvmerge writes Cues near the front and FFmpeg writes them at the
+    # end, and a truncated file looks fine because its SeekHead still names them.
+    CUES = b"\x1c\x53\xbb\x6b"
+    REF = b"\x53\xab\x84" + CUES
+
+    def scan(buf):
+        found_ref = False
+        i = buf.find(CUES)
+        while i != -1:
+            if i >= 3 and buf[i - 3:i + 4] == REF:
+                found_ref = True
+            else:
+                return True, found_ref
+            i = buf.find(CUES, i + 1)
+        return False, found_ref
+
+    try:
+        size = os.path.getsize(p)
+        ref_seen = False
+        with open(p, "rb") as fh:
+            head = fh.read(16 << 20)
+            present, r = scan(head)
+            ref_seen = ref_seen or r
+            if present:
+                return "yes"
+            if size > (16 << 20):
+                fh.seek(max(0, size - (16 << 20)))
+                present, r = scan(fh.read(16 << 20))
+                ref_seen = ref_seen or r
+                if present:
+                    return "yes"
+        return "referenced, not present" if ref_seen else "NO"
+    except Exception:
+        return "?"
+
+out["mkv.has_cues"] = has_cues(path)
+
+print(json.dumps(out))
+PY
+}
+
+if [[ $# -lt 1 ]]; then
+  echo "mkvdiff $VERSION"
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+fi
+
+case "$1" in
+  -h|--help)
+    echo "mkvdiff $VERSION"
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    echo "Modes"
+    echo "  mkvdiff FILE [FILE2]        dump fields, mark differences"
+    echo "  mkvdiff --start FILE        does the video decode from the head"
+    echo "  mkvdiff --peak FILE         sample bitrate across the film"
+    echo "  mkvdiff --luma FILE [F2]    picture brightness at ten timestamps"
+    echo "  mkvdiff --gop FILE [F2]     keyframes and picture types at the head"
+    echo "  mkvdiff --quality A B       PSNR and SSIM between two encodes"
+    echo "  mkvdiff --eyes FILE         which half is the left eye"
+    echo "  mkvdiff --subs FILE         will the subtitles show in both eyes"
+    echo "  mkvdiff --repair FILE [--chapters-from SRC]   rebuild the container"
+    echo "  mkvdiff --version"
+    exit 0 ;;
+  --version) echo "mkvdiff $VERSION"; exit 0 ;;
+esac
+
+# An unrecognised option used to fall through and be treated as a filename,
+# which fails with a stat error naming the flag. That reads like a broken file
+# rather than what it is, which is usually an older copy on PATH.
+case "$1" in
+  --start|--peak|--luma|--gop|--quality|--eyes|--eyes-brief|--repair|--subs) ;;
+  --*) echo "mkvdiff $VERSION: unknown option: $1" >&2
+       echo "This copy supports: --start --peak --luma --gop --quality --eyes --subs --repair" >&2
+       echo "If you expected it to, you are running an older mkvdiff." >&2
+       exit 1 ;;
+esac
+
+# --peak samples the stream at intervals rather than reading all of it, because
+# a feature at CRF 16 is tens of gigabytes and usually on a network share. A
+# player that decodes the opening minute and then fails may simply be meeting a
+# bitrate later in the film that it cannot sustain.
+# --start answers a specific question: does the video decode from the beginning
+# of the file? A player that gives you sound over a black picture, and recovers
+# if you seek forward, is telling you the head of the video stream is not
+# usable. Nothing in the container fields shows this.
+if [[ "$1" == "--start" ]]; then
+  shift
+  say "mkvdiff $VERSION"
+  say "Checking whether the video decodes from the head of the file"
+  [[ $# -ge 1 ]] || { echo "usage: mkvdiff --start FILE" >&2; exit 1; }
+  F="$1"
+  echo "  $(basename "$F")"
+  echo
+
+  FRAMES="$(ffmpeg -v error -stats -nostdin -i "$F" -map 0:v:0 -t 3 -f null - 2>&1 \
+    | tr '\r' '\n' | grep -o 'frame= *[0-9]*' | tail -1 | tr -dc '0-9' || true)"
+  FRAMES="${FRAMES:-0}"
+  echo "  frames decoded in first 3s   ${FRAMES}"
+
+  ED="$(ffprobe -v error -select_streams v:0 -show_entries stream=extradata_size \
+    -of default=nw=1:nk=1 "$F" 2>/dev/null | head -1 | tr -dc '0-9' || true)"
+  echo "  codec extradata bytes        ${ED:-unset}"
+
+  # Where each track actually begins. A large gap between them means the video
+  # is not missing, it simply has not started yet.
+  for spec in v:0 a:0; do
+    T="$(ffprobe -v error -select_streams "$spec" -show_entries packet=pts_time \
+      -read_intervals '%+5' -of csv=p=0 "$F" 2>/dev/null | head -1 \
+      | tr -d '[:space:],' || true)"
+    echo "  first ${spec} packet pts         ${T:-none}"
+  done
+
+  # The first keyframe. If it is not at or near zero there is nothing for a
+  # decoder to start from.
+  KF="$(ffprobe -v error -select_streams v:0 -skip_frame nokey \
+    -show_entries frame=pts_time -read_intervals '%+120' -of csv=p=0 "$F" 2>/dev/null \
+    | head -1 | tr -d '[:space:],' || true)"
+  echo "  first keyframe pts           ${KF:-none found in first 120s}"
+
+  echo
+  if [[ "$FRAMES" -lt 10 ]]; then
+    echo "  The video does not decode from the head of the file. Sound will play"
+    echo "  over a black picture until the player finds a later keyframe. This"
+    echo "  file is not usable as it stands."
+  else
+    echo "  The video decodes from the start, so a black picture is the player's"
+    echo "  doing rather than the file's."
+  fi
+  exit 0
+fi
+
+# --luma reports average picture brightness at a series of timestamps. An
+# opening that carries almost no data is either a broken encode or a genuinely
+# black opening, and those two look identical in every other measurement. Run
+# it against the source and the output and compare.
+# --gop lists the picture structure at the head of the file. A hardware decoder
+# needs a keyframe to start on and a DPB it can honour; a software decoder is
+# far more forgiving. When one plays a file and the other does not, the
+# difference is usually visible here and nowhere else.
+if [[ "$1" == "--gop" ]]; then
+  shift
+  say "mkvdiff $VERSION"
+  say "Reading keyframe placement and picture types"
+  [[ $# -ge 1 ]] || { echo "usage: mkvdiff --gop FILE [FILE2]" >&2; exit 1; }
+  gop() {  # $1 = file
+    echo "  $(basename "$1")"
+    # Parse JSON, not CSV: ffprobe emits CSV fields in its own internal order
+    # rather than the order requested, so positional parsing reads the wrong
+    # column as soon as the field set changes.
+    ffprobe -v error -select_streams v:0 -read_intervals '%+60' \
+      -show_entries frame=pts_time,pict_type,key_frame,pkt_size \
+      -of json "$1" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    frames = json.load(sys.stdin).get("frames", [])
+except Exception:
+    frames = []
+rows = []
+for f in frames:
+    try:
+        rows.append((float(f.get("pts_time", 0)), f.get("pict_type", "?"),
+                     int(f.get("key_frame", 0)), int(f.get("pkt_size", 0))))
+    except (TypeError, ValueError):
+        continue
+if not rows:
+    print("    no frames read")
+    raise SystemExit
+rows.sort()
+keys = [r for r in rows if r[2] == 1]
+print("    frames in first 60s        %d" % len(rows))
+print("    keyframes in first 60s     %d" % len(keys))
+print("    first keyframe times       %s" % ", ".join("%.2f" % k[0] for k in keys[:8]))
+if len(keys) > 1:
+    gaps = [keys[i+1][0] - keys[i][0] for i in range(len(keys)-1)]
+    print("    keyframe gap min/max       %.2fs / %.2fs" % (min(gaps), max(gaps)))
+else:
+    print("    keyframe gap               only one keyframe in the first 60s")
+types = {}
+for r in rows:
+    types[r[1]] = types.get(r[1], 0) + 1
+print("    picture types              %s" % ", ".join("%s=%d" % kv for kv in sorted(types.items())))
+sizes = sorted(r[3] for r in rows)
+print("    frame bytes min/med/max    %d / %d / %d" % (sizes[0], sizes[len(sizes)//2], sizes[-1]))
+print("    frames under 200 bytes     %d" % sum(1 for r in rows if r[3] < 200))
+'
+    echo
+  }
+  gop "$1"
+  [[ $# -ge 2 ]] && gop "$2"
+  exit 0
+fi
+
+# --quality measures how far apart two encodes of the same footage actually are.
+# "I think this one is slightly clearer" is very hard to trust on dark footage,
+# and this settles it in about a minute.
+# --eyes estimates which half of a side-by-side frame is the left eye, by
+# measuring horizontal disparity between the two halves.
+#
+# Two parallel cameras separated by b, converged so the screen plane sits at Zc,
+# give x_left - x_right = f*b*(1/Z - 1/Zc). Anything nearer than the screen is
+# positive, anything further is negative. Films keep most of the frame at or
+# behind the screen and use pop-out sparingly, so a correctly ordered pair
+# should measure negative overall. Swap the eyes and every sign flips.
+#
+# This is evidence, not proof. A scene composed mostly in front of the screen
+# would read the wrong way round, which is why it samples several timestamps and
+# reports them individually.
+# --subs answers the question that cost a viewing of Avatar to find: a PGS
+# display set may carry several composition objects, and the obvious way to
+# build a 3D subtitle track is to place the same bitmap twice. FFmpeg draws
+# both, so VLC looks right. ExoPlayer, which is what Jellyfin's Android TV
+# client decodes PGS with, reads composition object 0 and drops the rest, so
+# the right eye is empty and all you see there is crosstalk.
+#
+# Reads a few short windows rather than the whole track: a feature film's
+# subtitles are spread over 30 GB and demuxing all of it takes minutes.
+if [[ "$1" == "--subs" ]]; then
+  shift
+  say "mkvdiff $VERSION"
+  [[ $# -ge 1 ]] || { echo "usage: mkvdiff --subs FILE" >&2; exit 1; }
+  F="$1"
+  [[ -e "$F" ]] || { echo "no such file: $F" >&2; exit 1; }
+
+  DUR="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$F" 2>/dev/null || echo 0)"
+  NSUB="$(ffprobe -v error -select_streams s -show_entries stream=index -of csv=p=0 "$F" 2>/dev/null | wc -l | tr -d ' ')"
+  say "$NSUB subtitle track(s), ${DUR%.*}s long"
+  [[ "${NSUB:-0}" -gt 0 ]] || { echo "no subtitle tracks" >&2; exit 0; }
+
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/mkvdiff.subs.XXXXXX")"
+  trap 'rm -rf "$WORK"; rm -f "$TMPDIR_ERR"' EXIT
+
+  for ((t = 0; t < NSUB; t++)); do
+    CODEC="$(ffprobe -v error -select_streams "s:$t" -show_entries stream=codec_name \
+             -of default=nw=1:nk=1 "$F" 2>/dev/null | head -1)"
+    if [[ "$CODEC" != "hdmv_pgs_subtitle" ]]; then
+      say "track s:$t is $CODEC, not PGS. Nothing to check."
+      continue
+    fi
+    SUP="$WORK/t$t.sup"
+    : > "$SUP"
+    for frac in 15 40 65 90; do
+      SS="$(python3 -c "print(int(float('${DUR:-0}') * $frac / 100))" 2>/dev/null || echo 0)"
+      ffmpeg -v error -y -ss "$SS" -t 180 -i "$F" -map "0:s:$t" -c:s copy \
+             -f sup "$WORK/part.sup" 2>/dev/null || true
+      [[ -s "$WORK/part.sup" ]] && cat "$WORK/part.sup" >> "$SUP"
+      rm -f "$WORK/part.sup"
+    done
+    if [[ ! -s "$SUP" ]]; then
+      warn "track s:$t: no subtitles found in the sampled windows"
+      continue
+    fi
+    say "track s:$t"
+    python3 - "$SUP" <<'PY'
+import struct, sys
+
+H = struct.Struct(">2sIIBH")
+data = open(sys.argv[1], "rb").read()
+
+segs, pos = [], 0
+while pos + H.size <= len(data):
+    magic, pts, dts, kind, size = H.unpack_from(data, pos)
+    if magic != b"PG":
+        break
+    pos += H.size
+    if pos + size > len(data):
+        break
+    segs.append((kind, data[pos:pos + size]))
+    pos += size
+
+def decode_cols(rle, w, h):
+    """Columns that have any ink. Runs, not pixels, so this stays quick."""
+    cols = set()
+    x, rows, p, n = 0, 0, 0, len(rle)
+    while p < n and rows < h:
+        b = rle[p]
+        if b:
+            cols.add(x); x += 1; p += 1; continue
+        if p + 1 >= n:
+            break
+        f = rle[p + 1]
+        if f == 0:
+            rows += 1; x = 0; p += 2; continue
+        k = f & 0xC0
+        if k == 0x00:
+            run, col, p = f & 0x3F, 0, p + 2
+        elif k == 0x40:
+            run, col, p = ((f & 0x3F) << 8) | rle[p + 2], 0, p + 3
+        elif k == 0x80:
+            run, col, p = f & 0x3F, rle[p + 2], p + 3
+        else:
+            run, col, p = ((f & 0x3F) << 8) | rle[p + 2], rle[p + 3], p + 4
+        if col:
+            cols.update(range(x, min(x + run, w)))
+        x += run
+    return cols
+
+plane = None
+counts = {}
+first_obj_spans = []
+objects = {}
+pending = []
+
+def flush():
+    pcs = next((p for k, p in pending if k == 0x16), None)
+    if pcs is None or len(pcs) < 11:
+        return
+    global plane
+    w, h, rate, num, state, pf, pid, count = struct.unpack_from(">HHBHBBBB", pcs, 0)
+    plane = plane or w
+    if count == 0:
+        return
+    counts[count] = counts.get(count, 0) + 1
+    # assemble any objects in this set
+    buf, meta = bytearray(), None
+    for k, p in pending:
+        if k != 0x15 or len(p) < 4:
+            continue
+        oid, ver, seq = struct.unpack_from(">HBB", p, 0)
+        if seq & 0x80:
+            ow, oh = struct.unpack_from(">HH", p, 7)
+            meta = (oid, ow, oh); buf = bytearray(p[11:])
+        else:
+            buf += p[4:]
+        if seq & 0x40 and meta:
+            objects[meta[0]] = (meta[1], meta[2], bytes(buf))
+            meta, buf = None, bytearray()
+    oid, win, cropped = struct.unpack_from(">HBB", pcs, 11)
+    ox, oy = struct.unpack_from(">HH", pcs, 15)
+    if oid in objects and len(first_obj_spans) < 12:
+        ow, oh, rle = objects[oid]
+        cols = decode_cols(rle, ow, oh)
+        if cols:
+            first_obj_spans.append((ox + min(cols), ox + max(cols)))
+
+for k, p in segs:
+    pending.append((k, p))
+    if k == 0x80:
+        try:
+            flush()
+        except Exception:
+            pass
+        pending = []
+
+total = sum(counts.values())
+if not total:
+    print("      no display sets with anything on screen in the sampled windows")
+    raise SystemExit
+
+print("      plane                  %s" % plane)
+print("      display sets sampled   %d" % total)
+print("      composition objects    %s"
+      % ", ".join("%d in %d sets" % (c, n) for c, n in sorted(counts.items())))
+
+half = (plane or 0) // 2
+both = sum(1 for lo, hi in first_obj_spans if lo < half <= hi)
+left = sum(1 for lo, hi in first_obj_spans if hi < half)
+right = sum(1 for lo, hi in first_obj_spans if lo >= half)
+if first_obj_spans:
+    print("      first object covers    %d both eyes, %d left only, %d right only"
+          % (both, left, right))
+
+print()
+if max(counts) > 1:
+    print("      VERDICT: %d display set(s) use more than one composition object."
+          % sum(n for c, n in counts.items() if c > 1))
+    print("      FFmpeg draws them all, so VLC and mpv look correct. ExoPlayer")
+    print("      reads composition object 0 and drops the rest, so a Shield")
+    print("      shows the left eye only. Re-encode with mvc2sbs 3.52 or later.")
+elif first_obj_spans and both == len(first_obj_spans):
+    print("      VERDICT: one composition object per set, and its bitmap spans")
+    print("      both halves of the frame. This renders in both eyes on any")
+    print("      decoder, ExoPlayer included.")
+elif first_obj_spans:
+    print("      VERDICT: one composition object per set, but its bitmap sits in")
+    print("      one half of the frame only. These are flat 2D subtitles: they")
+    print("      will appear in one eye and read as a ghost in the other.")
+else:
+    print("      VERDICT: could not read any bitmap. The sampled windows may")
+    print("      have started mid-epoch, where objects are defined earlier.")
+PY
+  done
+  exit 0
+fi
+
+# --repair rebuilds the container without touching the video, for a file this
+# tool produced before the mux moved to MKVToolNix. It re-muxes with mkvmerge,
+# strips the chapter end times FFmpeg writes, and restores the StereoMode and
+# display dimensions. Minutes rather than hours, because nothing is re-encoded.
+if [[ "$1" == "--repair" ]]; then
+  shift
+  say "mkvdiff $VERSION"
+  [[ $# -ge 1 ]] || {
+    echo "usage: mkvdiff --repair FILE [OUTPUT] [--chapters-from SOURCE]" >&2; exit 1; }
+  F=""; OUT=""; CHAPSRC=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --chapters-from) CHAPSRC="$2"; shift 2 ;;
+      -*) echo "unknown option for --repair: $1" >&2; exit 1 ;;
+      *)  if   [[ -z "$F"   ]]; then F="$1"
+          elif [[ -z "$OUT" ]]; then OUT="$1"
+          else echo "too many files: $1" >&2; exit 1; fi
+          shift ;;
+    esac
+  done
+  [[ -e "$F" ]] || { echo "no such file: $F" >&2; exit 1; }
+  [[ -z "$CHAPSRC" || -e "$CHAPSRC" ]] || {
+    echo "no such file: $CHAPSRC" >&2; exit 1; }
+  for t in mkvmerge mkvextract mkvpropedit; do
+    command -v "$t" >/dev/null 2>&1 || { echo "$t not found. brew install mkvtoolnix" >&2; exit 1; }
+  done
+  [[ -n "$OUT" ]] || OUT="${F%.mkv}.repaired.mkv"
+  [[ "$OUT" != "$F" ]] || { echo "output must differ from input" >&2; exit 1; }
+
+  WRITER="$(mkvmerge -J "$F" 2>/dev/null | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get("container",{}).get("properties",{}).get("writing_application",""))
+except Exception: pass' || true)"
+  say "Muxed by: ${WRITER:-unknown}"
+  case "$WRITER" in
+    mkvmerge*) say "Already muxed by MKVToolNix. Repairing anyway, in case the
+      chapters carry end times." ;;
+  esac
+
+  # Keep whatever 3D tagging the file already has, so it survives the rebuild.
+  PROPS="$(mkvmerge -J "$F" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit
+vt = next((t for t in d.get("tracks", []) if t.get("type") == "video"), {})
+p = vt.get("properties", {})
+sm = p.get("stereo_mode")
+dd = p.get("display_dimensions", "")
+print("%s|%s" % ("" if sm is None else sm, dd))' || true)"
+  SM="${PROPS%%|*}"; DD="${PROPS##*|}"
+  [[ -n "$SM" ]] && say "Preserving StereoMode $SM and display ${DD:-unset}"
+
+  # A file that fell back to FFmpeg's mux has no chapters at all, because the
+  # script tells FFmpeg not to write any. Take them from the original rip.
+  CHFROM="${CHAPSRC:-$F}"
+  [[ -n "$CHAPSRC" ]] && say "Taking chapters from $(basename "$CHAPSRC")"
+  CHX="$(mktemp "${TMPDIR:-/tmp}/mkvdiff.ch.XXXXXX")"
+  if mkvextract "$CHFROM" chapters 2>/dev/null | sed '/ChapterTimeEnd/d' > "$CHX" && [[ -s "$CHX" ]]; then
+    N="$(grep -c '<ChapterAtom>' "$CHX" || true)"
+    say "Carrying ${N:-0} chapters across without end times"
+    CH=(--no-chapters --chapters "$CHX")
+  else
+    CH=(--no-chapters)
+    say "No chapters in $(basename "$CHFROM")"
+  fi
+
+  AVAIL_KB="$(df -Pk "$(dirname "$OUT")" | tail -1 | awk '{print $4}')"
+  NEED_KB="$(( $(stat -f%z "$F" 2>/dev/null || stat -c%s "$F") / 1024 ))"
+  if [[ "$AVAIL_KB" -lt $((NEED_KB + 1048576)) ]]; then
+    echo "only $((AVAIL_KB/1024/1024)) GB free where the output goes, and this needs about $((NEED_KB/1024/1024)) GB" >&2
+    rm -f "$CHX"; exit 1
+  fi
+
+  say "Remuxing to $(basename "$OUT"). Streams are copied, nothing is re-encoded."
+  MLOG="$(mktemp "${TMPDIR:-/tmp}/mkvdiff.mkvmerge.XXXXXX")"
+  RC=0
+  mkvmerge -q -o "$OUT" "${CH[@]}" "$F" >"$MLOG" 2>&1 || RC=$?
+  rm -f "$CHX"
+  # 1 is warnings, 2 is failure. Treating 1 as failure is what threw away a good
+  # file in mvc2sbs and kept FFmpeg's instead.
+  if [[ $RC -ne 0 ]]; then
+    sed 's/^/  /' "$MLOG" >&2
+    if [[ $RC -eq 1 && -s "$OUT" ]]; then
+      say "mkvmerge reported warnings above. The file is fine."
+    else
+      rm -f "$MLOG"; echo "mkvmerge exited $RC" >&2; exit 1
+    fi
+  fi
+  rm -f "$MLOG"
+
+  # mkvmerge writes the interlacing flag as undetermined, and for HEVC there is
+  # nothing in the bitstream to fall back on, so field_order comes out unknown
+  # where FFmpeg's muxer had said progressive. 2 means progressive.
+  ARGS=(--edit track:v1 --set "interlaced=2")
+  [[ -n "$SM" ]] && ARGS+=(--set "stereo-mode=$SM")
+  if [[ "$DD" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    ARGS+=(--set "display-width=${BASH_REMATCH[1]}" --set "display-height=${BASH_REMATCH[2]}")
+  fi
+  mkvpropedit "$OUT" "${ARGS[@]}" >/dev/null
+  say "Restored the progressive flag${SM:+, StereoMode and display dimensions}"
+  echo
+  say "Done: $OUT"
+  say "Check it with: mkvdiff \"$F\" \"$OUT\""
+  exit 0
+fi
+
+if [[ "$1" == "--eyes" || "$1" == "--eyes-brief" ]]; then
+  BRIEF=0
+  [[ "$1" == "--eyes-brief" ]] && BRIEF=1
+  shift
+  if [[ $BRIEF -eq 0 ]]; then
+    say "mkvdiff $VERSION"
+    say "Estimating eye order from horizontal disparity"
+  fi
+  [[ $# -ge 1 ]] || { echo "usage: mkvdiff --eyes FILE" >&2; exit 1; }
+  F="$1"
+  # Say which file, and check it is there. "could not read dimensions" with the
+  # real error thrown away is the least useful thing this could print, and it is
+  # the third time in this tool that a 2>/dev/null has hidden the actual cause.
+  [[ -e "$F" ]] || { echo "no such file: $F" >&2; exit 1; }
+  [[ -r "$F" ]] || { echo "cannot read: $F" >&2; exit 1; }
+  [[ $BRIEF -eq 1 ]] || say "Reading $(basename "$F")"
+  # JSON, not csv. The rest of this tool probes with JSON and it works on every
+  # file that has been thrown at it; the csv form returned an empty string on a
+  # real file with no error, which is not a failure mode worth debugging when a
+  # known-good path is already here.
+  DIMS="$(ffprobe -v error -show_streams -of json -probesize 200M \
+          -analyzeduration 200M "$F" 2>"$TMPDIR_ERR" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for s in d.get("streams", []):
+    if s.get("codec_type") == "video" and s.get("width") and s.get("height"):
+        print("%d,%d" % (s["width"], s["height"]))
+        break
+' || true)"
+  FW="${DIMS%%,*}"; FH="${DIMS##*,}"
+  if [[ -z "$FW" || -z "$FH" ]]; then
+    echo "could not read the video dimensions from $F" >&2
+    echo "ffprobe said:" >&2
+    head -5 "$TMPDIR_ERR" >&2 || true
+    echo "run this to see the raw output:" >&2
+    echo "  ffprobe -v error -show_streams -of json \"$F\" | head -40" >&2
+    exit 1
+  fi
+  # A full side-by-side frame is about 32:9. An ordinary 16:9 frame is 2D and
+  # block-matching its two halves against each other is meaningless.
+  if (( FW * 9 < FH * 24 )); then
+    echo "  ${FW}x${FH} is roughly $(python3 -c "print('%.2f' % ($FW/$FH))"):1, which looks"
+    echo "  like an ordinary 2D frame rather than two eyes side by side. A"
+    echo "  Full-SBS frame is about 3.56:1. Nothing to measure here."
+    exit 1
+  fi
+  DUR="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$F" \
+         2>/dev/null | head -1 | cut -d. -f1)"
+  [[ -n "$DUR" ]] || DUR=60
+
+  # The StereoMode flag decides how a player reads the two halves, and it can be
+  # changed without touching a pixel. Measuring disparity alone therefore says
+  # nothing about what you will actually see: a file flagged right-eye-first
+  # wants the opposite sign from one flagged left-eye-first.
+  #   1 = side by side, left eye first      11 = side by side, right eye first
+  #   3 = top-bottom,  left eye first        2 = top-bottom,  right eye first
+  SMODE="$(mkvmerge -J "$F" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit
+vt = next((t for t in d.get("tracks", []) if t.get("type") == "video"), {})
+sm = vt.get("properties", {}).get("stereo_mode")
+print("" if sm is None else sm)' || true)"
+  case "$SMODE" in
+    11|2) FLIP=1; FLAGTXT="right eye first (StereoMode $SMODE)" ;;
+    1|3)  FLIP=0; FLAGTXT="left eye first (StereoMode $SMODE)" ;;
+    "")   FLIP=0; FLAGTXT="no StereoMode flag, so players assume left eye first" ;;
+    *)    FLIP=0; FLAGTXT="StereoMode $SMODE" ;;
+  esac
+  [[ $BRIEF -eq 1 ]] || { say "Flagged as: $FLAGTXT"; echo; }
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/mkvdiff.eyes.XXXXXX")"
+  # Downscaled hard, because the matcher is plain Python. The sign of the
+  # disparity is what matters, not its exact magnitude, and 320 pixels per eye
+  # is ample for that. numpy is not installed on a stock macOS python3 and
+  # nothing else here needs it.
+  SW=320
+  for i in 1 2 3 4 5 6; do
+    T=$(( DUR * i / 7 ))
+    ffmpeg -v error -ss "$T" -i "$F" -frames:v 1 \
+      -vf "scale=$((SW*2)):-2,format=gray" -f rawvideo "$WORK/f$i.gray" 2>/dev/null || true
+  done
+  python3 - "$WORK" "$SW" "$FLIP" "$FLAGTXT" "$BRIEF" <<'PY2'
+import glob, os, sys
+
+work, SW = sys.argv[1], int(sys.argv[2])
+flip, flagtxt, brief = int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+P, MAX, STEP = 32, 24, 40           # patch, search range, grid spacing
+
+def median(v):
+    v = sorted(v)
+    n = len(v)
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
+rows = []
+for path in sorted(glob.glob(os.path.join(work, "*.gray"))):
+    data = open(path, "rb").read()
+    W = SW * 2
+    if not data or len(data) % W:
+        continue
+    H = len(data) // W
+
+    def px(x, y):
+        return data[y * W + x]
+
+    found = []
+    for y in range(20, H - P - 20, max(16, (H - 40) // 6)):
+        for x in range(MAX + 10, SW - P - MAX - 10, STEP):
+            # Skip flat patches: they match everywhere and mean nothing.
+            vals = [px(x + i, y + j) for j in range(0, P, 4) for i in range(0, P, 4)]
+            lo, hi = min(vals), max(vals)
+            if hi - lo < 24:
+                continue
+            best = bestd = None
+            for d in range(-MAX, MAX + 1):
+                total = 0
+                for j in range(0, P, 2):
+                    ry = y + j
+                    for i in range(0, P, 2):
+                        total += abs(px(x + i, ry) - px(SW + x - d + i, ry))
+                if best is None or total < best:
+                    best, bestd = total, d
+            if best is not None:
+                n = (P // 2) * (P // 2)
+                if best / n < 14:          # only trust a genuinely good match
+                    found.append(bestd)
+    if len(found) >= 5:
+        rows.append((os.path.basename(path), len(found), median(found)))
+
+if not rows:
+    print("unknown 0.0" if brief else "  No frame gave enough matchable detail. Try a busier scene.")
+    raise SystemExit
+
+if brief:
+    meds = sorted(m for _, _, m in rows)
+    overall = meds[len(meds) // 2] if len(meds) % 2 else (meds[len(meds)//2 - 1] + meds[len(meds)//2]) / 2.0
+    as_seen = -overall if flip else overall
+    if abs(overall) < 1.0:
+        print("unknown %+.1f" % as_seen)
+    else:
+        print("%s %+.1f" % ("ok" if as_seen < 0 else "inverted", as_seen))
+    raise SystemExit
+
+print("  %-10s %6s  %s" % ("frame", "points", "median disparity"))
+for name, n, med in rows:
+    print("  %-10s %6d  %+7.1f px" % (name, n, med))
+meds = [m for _, _, m in rows]
+overall = median(meds)
+agree = sum(1 for m in meds if (m < 0) == (overall < 0))
+print()
+print("  overall median %+.1f px, %d of %d frames agree on the sign" % (overall, agree, len(meds)))
+print()
+# The measurement describes the frame. The flag describes how it will be read.
+# Only the two together say what a viewer gets.
+as_seen = -overall if flip else overall
+print("  flagged %s" % flagtxt)
+if flip:
+    print("  so the sign above is inverted from the viewer's point of view: %+.1f" % as_seen)
+print()
+if abs(overall) < 1.0:
+    print("  Too close to zero to call. Either the footage is nearly flat here,")
+    print("  or the two halves are not a stereo pair at all.")
+elif as_seen < 0:
+    print("  As flagged, this reads correctly: most of the frame sits behind the")
+    print("  screen plane, which is how films are composed.")
+else:
+    print("  As flagged, most of the frame reads as being in front of the screen.")
+    print("  That is unusual in a film and is what inverted depth looks like.")
+    print()
+    print("  Fix without re-encoding, by changing how players read the halves:")
+    print("    mkvpropedit FILE --edit track:v1 --set stereo-mode=%d" % (1 if flip else 11))
+    print("  Or rebuild the frame itself with mvc2sbs --swap-eyes, which is only")
+    print("  needed for players that ignore the flag.")
+print()
+print("  Evidence, not proof. A scene composed mostly in front of the screen")
+print("  would read the wrong way round. Judge it with your own eyes as well.")
+PY2
+  rm -rf "$WORK"
+  exit 0
+fi
+
+if [[ "$1" == "--quality" ]]; then
+  shift
+  [[ $# -ge 2 ]] || { echo "usage: mkvdiff --quality FILE_A FILE_B" >&2; exit 1; }
+  A="$1"; B="$2"
+  say "mkvdiff $VERSION"
+  say "Comparing $(basename "$A") against $(basename "$B")"
+  echo
+  echo "  This measures how far apart these two files are. It does not say"
+  echo "  which is closer to the source. Two lossy encodes can differ by 45 dB"
+  echo "  with either one being the better of the two. To rank encoders, encode"
+  echo "  a near-lossless reference and compare each candidate against that."
+  echo
+  # Guard the obvious misuse. Comparing an excerpt against a whole film, or two
+  # different resolutions, still produces a number, and the number is nonsense.
+  dims() { ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+           -of csv=p=0 "$1" 2>/dev/null | head -1; }
+  secs() { ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 \
+           "$1" 2>/dev/null | head -1 | cut -d. -f1; }
+  if [[ "$(dims "$A")" != "$(dims "$B")" ]]; then
+    echo "  Different resolutions ($(dims "$A") against $(dims "$B")). Not comparable."
+    exit 1
+  fi
+  DA="$(secs "$A")"; DB="$(secs "$B")"
+  if [[ -n "$DA" && -n "$DB" && "$DA" -ne "$DB" ]]; then
+    echo "  Different durations (${DA}s against ${DB}s). Compare two excerpts cut"
+    echo "  with the same --start and --limit, not an excerpt against a film."
+    exit 1
+  fi
+  # Two passes: psnr and ssim cannot both consume the same input pads in one
+  # graph without splitting, and both report at info level, so -v error would
+  # discard the very lines being asked for.
+  say "Decoding both files and measuring PSNR. This reads every frame, so it
+      takes about as long as playing the clip."
+  PSNR="$(ffmpeg -hide_banner -i "$A" -i "$B" -lavfi "[0:v][1:v]psnr" -f null - 2>&1 \
+    | grep -o 'average:[0-9.]*' | tail -1 | cut -d: -f2 || true)"
+  say "Measuring SSIM"
+  SSIM="$(ffmpeg -hide_banner -i "$A" -i "$B" -lavfi "[0:v][1:v]ssim" -f null - 2>&1 \
+    | grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2 || true)"
+  OUT="$(ffmpeg -hide_banner -i "$A" -i "$B" -lavfi "[0:v][1:v]psnr" -f null - 2>&1 | tail -3 || true)"
+  if [[ -z "$PSNR" ]]; then
+    echo "  could not compare. Both files must have the same resolution and"
+    echo "  frame count, so compare two excerpts made with the same --start"
+    echo "  and --limit, not an excerpt against a whole film."
+    printf '%s\n' "$OUT" | head -3
+    exit 1
+  fi
+  SA="$(stat -f%z "$A" 2>/dev/null || stat -c%s "$A" 2>/dev/null || echo 0)"
+  SB="$(stat -f%z "$B" 2>/dev/null || stat -c%s "$B" 2>/dev/null || echo 0)"
+  echo "  PSNR  ${PSNR} dB      difference between the two, higher means closer"
+  echo "  SSIM  ${SSIM:-n/a}      structural similarity, 1.0 is identical"
+  echo
+  python3 - "$SA" "$SB" "$(basename "$A")" "$(basename "$B")" <<'PY3'
+import sys
+a, b, na, nb = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+print("  %-28s %8.1f MB" % (na, a / 1e6))
+print("  %-28s %8.1f MB" % (nb, b / 1e6))
+if a and b:
+    small, big = (na, nb) if a < b else (nb, na)
+    ratio = max(a, b) / min(a, b)
+    print("  %s is %.1fx smaller" % (small, ratio))
+PY3
+  echo
+  python3 - "$PSNR" <<'PY2'
+import sys
+p = float(sys.argv[1])
+if p >= 45:
+    print("  Above 45 dB: these two are near enough identical that a visible")
+    print("  difference between them is very unlikely. Judge on the sizes above")
+    print("  and on how long each took. Equal quality at four times the size is")
+    print("  not a win unless encode time matters more than disk.")
+elif p >= 40:
+    print("  40 to 45 dB. A real but small difference, normally invisible in")
+    print("  motion and occasionally visible on a still dark frame.")
+elif p >= 35:
+    print("  35 to 40 dB. A genuine difference. Worth judging by eye on the")
+    print("  content you care about rather than on the number.")
+else:
+    print("  Below 35 dB. Clearly different. The lower CRF is doing real work.")
+PY2
+  exit 0
+fi
+
+if [[ "$1" == "--luma" ]]; then
+  shift
+  say "mkvdiff $VERSION"
+  say "Measuring picture brightness at ten timestamps"
+  [[ $# -ge 1 ]] || { echo "usage: mkvdiff --luma FILE [FILE2]" >&2; exit 1; }
+  luma() {  # $1 = file
+    echo "  $(basename "$1")"
+    local err=""
+    for t in 0 5 10 15 20 30 45 60 90 120; do
+      # Send the metadata to stdout and the muxer to /dev/null, and keep
+      # stderr, because an extraction that fails silently is worse than useless.
+      local raw
+      raw="$(ffmpeg -v error -ss "$t" -i "$1" -frames:v 1 \
+             -vf "signalstats,metadata=print:file=-" \
+             -an -sn -f null /dev/null 2>/tmp/mkvdiff.luma.err || true)"
+      Y="$(printf '%s' "$raw" | grep -o 'YAVG=[0-9.]*' | head -1 | cut -d= -f2 || true)"
+      if [[ -z "$Y" ]]; then
+        err="$(head -2 /tmp/mkvdiff.luma.err 2>/dev/null | tr '\n' ' ')"
+        printf '    %4ds  no frame%s\n' "$t" "${err:+  ($err)}"
+      else
+        BAR="$(python3 -c 'import sys; y=float(sys.argv[1]); print("#"*int(min(50,max(0,(y-16)/4))))' "$Y")"
+        printf '    %4ds  YAVG %7s  %s\n' "$t" "$Y" "$BAR"
+      fi
+    done
+    rm -f /tmp/mkvdiff.luma.err
+    echo
+  }
+  luma "$1"
+  [[ $# -ge 2 ]] && luma "$2"
+  echo "  YAVG 16 is broadcast black. A row at or near 16 is a black frame."
+  echo "  If the source is black at the same timestamps, the encode is correct"
+  echo "  and the film simply opens on black."
+  exit 0
+fi
+
+if [[ "$1" == "--peak" ]]; then
+  shift
+  say "mkvdiff $VERSION"
+  say "Sampling bitrate across the file"
+  [[ $# -ge 1 ]] || { echo "usage: mkvdiff --peak FILE" >&2; exit 1; }
+  F="$1"
+  DUR="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$F" \
+         | head -1 | tr -d '[:space:],')"
+  [[ "$DUR" =~ ^[0-9.]+$ ]] || { echo "could not read duration" >&2; exit 1; }
+  echo "  Sampling the opening plus 12 windows across ${DUR}s of $(basename "$F")"
+  echo
+  python3 - "$F" "$DUR" <<'PY2'
+import subprocess, sys
+path, dur = sys.argv[1], float(sys.argv[2])
+peak_overall = 0.0
+peak_at = 0.0
+rows = []
+# The opening matters on its own account. A film that starts on a long dark
+# grainy shot is at its most expensive in the first minute, which is exactly
+# where a player that cannot sustain the rate will fail, and exactly what a
+# sampling grid spread over the whole runtime steps straight over.
+starts = [0.0, 15.0, 30.0, 60.0, 120.0]
+starts += [dur * (i + 0.5) / 12.0 for i in range(12)]
+starts = sorted(set(t for t in starts if t < dur - 8))
+for start in starts:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-read_intervals", "%d%%+8" % int(start),
+         "-show_entries", "packet=pts_time,size",
+         "-of", "csv=p=0", path],
+        capture_output=True, text=True).stdout
+    buckets = {}
+    for line in out.splitlines():
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            t, sz = float(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        buckets[int(t)] = buckets.get(int(t), 0) + sz
+    if not buckets:
+        rows.append((start, None))
+        continue
+    # Drop the first and last bucket: both are partial windows.
+    keys = sorted(buckets)[1:-1] or sorted(buckets)
+    mbps = max(buckets[k] for k in keys) * 8 / 1e6
+    rows.append((start, mbps))
+    if mbps > peak_overall:
+        peak_overall, peak_at = mbps, start
+
+for start, mbps in rows:
+    m, sec = divmod(int(start), 60)
+    label = "%02d:%02d" % (m, sec)
+    if mbps is None:
+        print("  %s  no video packets read" % label)
+    else:
+        bar = "#" * min(60, int(mbps / 2))
+        print("  %s  %6.1f Mbps  %s" % (label, mbps, bar))
+
+print()
+if peak_overall:
+    m, sec = divmod(int(peak_at), 60)
+    print("  peak sampled second: %.1f Mbps at %02d:%02d" % (peak_overall, m, sec))
+    print()
+    if peak_overall > 100:
+        print("  Above 100 Mbps. Set-top hardware decoders commonly stall here even")
+        print("  when the level in the header says the file is legal. If a player")
+        print("  refuses this file, cap the rate and re-test before blaming anything")
+        print("  else: --extra \"-maxrate 60M -bufsize 120M\"")
+    else:
+        print("  Within what set-top hardware normally sustains, so bitrate is")
+        print("  probably not why a player is refusing this file.")
+PY2
+  exit 0
+fi
+
+if [[ $# -lt 2 ]]; then
+  say "mkvdiff $VERSION"
+  say "Reading $(basename "$1")"
+else
+  say "mkvdiff $VERSION"
+  say "Comparing $(basename "$1") against $(basename "$2")"
+fi
+A="$(dump "$1")"
+if [[ $# -lt 2 ]]; then
+  python3 -c '
+import json,sys
+d=json.loads(sys.argv[1])
+for k,v in d.items(): print(f"  {k:22} {v}")
+' "$A"
+  exit 0
+fi
+
+B="$(dump "$2")"
+python3 - "$A" "$B" <<'PY'
+import json, sys
+a, b = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+keys = list(dict.fromkeys(list(a) + list(b)))
+w = max(len(k) for k in keys)
+print(f"  {'field'.ljust(w)}  {'FILE 1':<34} {'FILE 2':<34}")
+print(f"  {'-'*w}  {'-'*34} {'-'*34}")
+diffs = 0
+for k in keys:
+    va, vb = str(a.get(k, "-")), str(b.get(k, "-"))
+    mark = "" if va == vb else "  <-- DIFFERS"
+    if mark: diffs += 1
+    print(f"  {k.ljust(w)}  {va:<34} {vb:<34}{mark}")
+print()
+print(f"  {diffs} field(s) differ" if diffs else "  identical on every field checked")
+PY

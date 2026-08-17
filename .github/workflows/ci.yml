@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Shell and Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Shellcheck
+        run: shellcheck -S warning mvc2sbs mkvdiff mkvshrink install-mac3d.sh app/build-app.sh
+
+      - name: Bash syntax
+        run: |
+          for f in mvc2sbs mkvdiff mkvshrink install-mac3d.sh app/build-app.sh; do
+            bash -n "$f"
+          done
+
+      - name: Python syntax
+        run: python3 -m py_compile pgs3d.py subs3d app/make-icon.py
+
+  pgs3d:
+    name: PGS subtitle transform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Build a synthetic PGS stream, convert it, verify both eyes render
+        run: python3 tests/test_pgs3d.py
+
+  settings:
+    name: Settings coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Every setting is decoded and every setting is used
+        run: python3 tests/test_settings_coverage.py
+
+      - name: Version matches the changelog
+        run: python3 tests/test_version.py
+
+      - name: Installer actually installs
+        run: ./tests/test_install.sh
+
+      - name: Swift structure
+        run: python3 tests/test_swift_structure.py
+
+      - name: Tools use only the standard library
+        run: python3 tests/test_no_third_party_python.py
+
+      - name: Automatic output naming
+        run: python3 tests/test_clean_name.py
+
+      - name: Subtitle timestamps survive the mux
+        run: python3 tests/test_sub_timing.py
+
+      - name: 3D subtitle placement
+        run: python3 tests/test_subs3d.py
+
+      - name: Help index is well formed
+        run: python3 tests/test_help_index.py
+
+  build-app:
+    name: Build the macOS app
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        # The decoder is fetched and compiled by the build script, which is the
+        # part most likely to rot, so build it rather than skipping it.
+        run: cd app && ./build-app.sh
+
+      - name: Check the bundle has everything it should
+        run: |
+          APP="app/build/MVC2SBS.app"
+          for f in Contents/MacOS/MVC2SBS \
+                   Contents/Resources/mvc2sbs \
+                   Contents/Resources/pgs3d.py \
+                   Contents/Resources/edge264_test \
+                   Contents/Info.plist; do
+            test -e "$APP/$f" || { echo "missing: $f"; exit 1; }
+            echo "ok: $f"
+          done
