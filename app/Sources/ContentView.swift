@@ -296,8 +296,6 @@ let helpSections: [HelpSection] = [
         HelpRow(heading: "Wrong aspect ratio", body: "The 3D flag needs mkvtoolnix installed. Without mkvpropedit the output carries no StereoMode and no per-eye display size, so players stretch it to double width."),
     ]),
     HelpSection(title: "Credits", rows: [
-        HelpRow(heading: "subs3d", body: "Adds subtitles to a side-by-side film that has none. A player draws an ordinary subtitle once across the whole frame, so on an SBS file each eye gets half the sentence. This takes an SRT or an existing ASS and writes both a PGS bitmap track and a text ASS track, each line placed twice, once per eye, with a depth control. --mux puts them in the file with mkvmerge and nothing is re-encoded.\n$ subs3d dialogue.srt --depth 20 --mux movie.mkv"),
-        HelpRow(heading: "Why two subtitle formats", body: "No single one plays everywhere, so the file carries both and the player picks. PGS is bitmaps, the Blu-ray format: the typeface is baked in, it needs no font on the player, and it direct plays on a Shield. That is how a disc gives you a custom typeface for something like the Na'\u{2019}vi dialogue in Avatar. ASS is text: small, restylable, correct in VLC, mpv, Kodi and Infuse, but ExoPlayer's support is partial so Jellyfin may ignore the positioning. Use --format pgs or --format ass to write just one."),
         HelpRow(heading: "edge264", body: "The MVC decoder, and the reason this can exist at all. By Thibault Raffaillac and Celticom/TVLabs, MVC fork by Chris Busillo and Jens Duttke. BSD licensed. [Source](https://github.com/cbusillo/edge264-mvc)"),
         HelpRow(heading: "BD_to_AVP", body: "Chris Busillo's macOS 3D Blu-ray converter for Apple Vision Pro. Its use of edge264 showed this approach was viable. [Source](https://github.com/cbusillo/BD_to_AVP)"),
         HelpRow(heading: "BD3D2MK3D", body: "The Windows tool this replaces, by r0lZ. No code taken from it, but it defined what the output should look like. [Details](https://www.videohelp.com/software/BD3D2MK3D)"),
@@ -682,7 +680,7 @@ struct SettingsForm: View {
                     .buttonStyle(.bordered)
                     .help("Output folder and file name")
             }
-            GroupBox("Video") {
+            GroupBox {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Text("Format").frame(width: 70, alignment: .leading)

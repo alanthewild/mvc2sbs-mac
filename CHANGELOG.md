@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.67
+
+- The subs3d help entries were in Credits as well as in "What is in the box".
+  A str.replace matched a prefix shared by two rows and inserted them at both.
+  The Credits copies are gone, and test_help_index.py now fails on any two rows
+  with the same heading AND the same text, which is what an over-eager replace
+  looks like. A heading reused with different text stays legal, since that is
+  deliberate. Verified by reintroducing the fault and watching it fail.
+- The Video group label is gone from the right panel. It is the only group there
+  now, so it labelled nothing.
+
+
 ## 3.66
 
 - **The README had gone stale in twelve places and one of them would break a
