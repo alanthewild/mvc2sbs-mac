@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.65
+
+- **The top and bottom panes are back exactly as they were before 3.59.**
+  I misread the original report. "The bottom Sources panel takes up half the
+  window with no file but a third when a file is added" was about the width of
+  the Sources column inside the track panel, and I read it as the height of the
+  panel. So 3.59 changed a split that never had a problem, and 3.64 made that
+  same split draggable to work around a wrong starting figure I had introduced
+  myself. Both are undone.
+- The real fault was the three columns being flexible: with an empty Audio and
+  Subtitles column, Sources took the slack. Fixed fractions in 3.62 and 3.63
+  had already solved it.
+- The horizontal drag handle is removed rather than left in as an unused
+  option.
+- **The 3.64 archive reported itself as 3.63.** The version bump sat behind a
+  `&&` in the same command as a failing test, so it never ran and the mismatch
+  shipped. test_version.py catches exactly this, and did, one release late.
+  Anything stamped 3.63 may be either build; 3.65 supersedes both.
+
+
 ## 3.63
 
 - **You can see where the columns are again.** A plain Divider is a hairline at

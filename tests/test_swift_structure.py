@@ -171,12 +171,15 @@ for path in sorted(SRC_DIR.glob("*.swift")):
                     % (name, struct_name, labels, order)
                 )
 
-    # NSCursor.push() and pop() have to balance or the resize cursor leaks out
-    # over the rest of the window and stays there.
-    pushes = len(re.findall(r"NSCursor\.\w+\.push\(\)", src))
-    pops = len(re.findall(r"NSCursor\.pop\(\)", src))
-    if pushes != pops:
-        failures.append("%s: %d NSCursor push against %d pop" % (name, pushes, pops))
+    # NSCursor push and pop have to balance or the resize arrows leak out over
+    # the rest of the window and stay there until the app restarts. Counted on
+    # the calls rather than on "NSCursor.something.push()", because the cursor
+    # is often held in a local first, which that pattern silently missed.
+    if "NSCursor" in src:
+        pushes = len(re.findall(r"\.push\(\)", src))
+        pops = len(re.findall(r"\.pop\(\)", src))
+        if pushes != pops:
+            failures.append("%s: %d cursor push against %d pop" % (name, pushes, pops))
 
 
 print("checked %d Swift files" % len(list(SRC_DIR.glob("*.swift"))))

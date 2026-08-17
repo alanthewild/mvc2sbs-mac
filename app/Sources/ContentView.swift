@@ -12,38 +12,33 @@ struct ContentView: View {
     @State private var showSettings = false
 
     var body: some View {
-        // Both halves of this window are flexible, so left to itself SwiftUI
-        // split the space by how much content each happened to hold: the track
-        // panel took half the window with nothing loaded and a third with a
-        // file selected. Measure the window instead, so the split is the same
-        // whatever is on screen.
-        GeometryReader { win in
-            VStack(spacing: 0) {
-                ToolbarBar(showSettings: $showSettings)
-                Divider()
-                if !queue.toolWarning.isEmpty {
-                    WarningStrip(text: queue.toolWarning,
-                                 advisory: queue.toolWarningIsAdvisory,
-                                 onRecheck: { queue.refreshToolWarning() })
-                }
-                // The drop zone needs enough room to be an obvious target and
-                // no more. The settings panel is where the work happens, so it
-                // gets the other two thirds.
+        VStack(spacing: 0) {
+            ToolbarBar(showSettings: $showSettings)
+            Divider()
+            if !queue.toolWarning.isEmpty {
+                WarningStrip(text: queue.toolWarning,
+                             advisory: queue.toolWarningIsAdvisory,
+                             onRecheck: { queue.refreshToolWarning() })
+            }
+            // The drop zone needs enough room to be an obvious target and no
+            // more. The settings panel is where the work happens, so it gets
+            // the other two thirds.
+            GeometryReader { geo in
                 HStack(spacing: 0) {
                     DropZone()
-                        .frame(width: max(300, win.size.width / 3))
+                        .frame(width: max(300, geo.size.width / 3))
                     Divider()
                     RightPanel()
                         .frame(maxWidth: .infinity)
                 }
-                .frame(maxHeight: .infinity)
-                Divider()
-                BottomPanel()
-                    .frame(height: max(220, win.size.height * 0.28))
-                    .sheet(isPresented: $queue.consoleVisible) { ConsoleSheet() }
-                Divider()
-                StatusBar()
             }
+            .frame(minHeight: 300)
+            Divider()
+            BottomPanel()
+                .frame(minHeight: 220)
+                .sheet(isPresented: $queue.consoleVisible) { ConsoleSheet() }
+            Divider()
+            StatusBar()
         }
         .frame(minWidth: 1140, minHeight: 860)
         .sheet(isPresented: $showSettings) { SettingsSheet() }
@@ -83,6 +78,10 @@ struct SplitHandle: View {
         .frame(width: 11)
         .onHover { inside in
             hovering = inside
+            // One push against one pop. Two pushes in exclusive branches would
+            // be correct too, but it is harder to see that it balances, and an
+            // unbalanced cursor stack leaks the resize arrows over the rest of
+            // the window until the app is restarted.
             if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
         }
         .gesture(
