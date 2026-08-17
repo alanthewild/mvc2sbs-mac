@@ -62,15 +62,27 @@ struct SplitHandle: View {
     let onEnd: () -> Void
     let onReset: () -> Void
 
+    @State private var hovering = false
+
     var body: some View {
         ZStack {
-            Divider()
+            // A plain Divider is a hairline at the system separator colour,
+            // which on a dark background against an empty panel is invisible.
+            // An explicit rule plus a grip says both "the column ends here"
+            // and "you can drag this".
+            Rectangle()
+                .fill(Color.primary.opacity(0.22))
+                .frame(width: 1)
+            Capsule()
+                .fill(Color.primary.opacity(hovering ? 0.8 : 0.4))
+                .frame(width: 4, height: 30)
             Rectangle()
                 .fill(Color.clear)
                 .contentShape(Rectangle())
         }
-        .frame(width: 10)
+        .frame(width: 11)
         .onHover { inside in
+            hovering = inside
             if inside { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
         }
         .gesture(
@@ -1056,8 +1068,10 @@ struct FolderRow: View {
 struct BottomPanel: View {
     @EnvironmentObject var queue: QueueController
 
-    @AppStorage("bottomSourcesFraction") private var sourcesFraction: Double = 0.37
-    @AppStorage("bottomAudioFraction") private var audioFraction: Double = 0.35
+    // 3.61 gave the three columns equal space, so that is where these start.
+    // Anything else is me deciding how wide your filenames are.
+    @AppStorage("bottomSourcesFraction") private var sourcesFraction: Double = 1.0 / 3.0
+    @AppStorage("bottomAudioFraction") private var audioFraction: Double = 1.0 / 3.0
     /// Where a drag started. Translation is measured from the start of the
     /// gesture, so without this the columns jump on every drag event.
     @State private var dragBase: CGFloat? = nil
@@ -1069,7 +1083,7 @@ struct BottomPanel: View {
     /// Clamped on the way out as well as on the way in, so a split saved on a
     /// wide display cannot leave a column unusable on a narrow one.
     private func widths(_ total: CGFloat) -> (CGFloat, CGFloat) {
-        let room = max(total - 20, 1)          // the two grab handles
+        let room = max(total - 22, 1)          // the two grab handles
         var src = min(max(BottomPanel.minSources, room * CGFloat(sourcesFraction)),
                       room - BottomPanel.minAudio - BottomPanel.minSubs)
         src = max(src, BottomPanel.minSources)
@@ -1088,20 +1102,20 @@ struct BottomPanel: View {
                     onDrag: { dx in
                         let base = dragBase ?? widths(geo.size.width).0
                         dragBase = base
-                        sourcesFraction = Double((base + dx) / max(geo.size.width - 20, 1))
+                        sourcesFraction = Double((base + dx) / max(geo.size.width - 22, 1))
                     },
                     onEnd: { dragBase = nil },
-                    onReset: { sourcesFraction = 0.37 })
+                    onReset: { sourcesFraction = 1.0 / 3.0 })
                 TrackColumn(kind: "audio")
                     .frame(width: widths(geo.size.width).1)
                 SplitHandle(
                     onDrag: { dx in
                         let base = dragBase ?? widths(geo.size.width).1
                         dragBase = base
-                        audioFraction = Double((base + dx) / max(geo.size.width - 20, 1))
+                        audioFraction = Double((base + dx) / max(geo.size.width - 22, 1))
                     },
                     onEnd: { dragBase = nil },
-                    onReset: { audioFraction = 0.35 })
+                    onReset: { audioFraction = 1.0 / 3.0 })
                 TrackColumn(kind: "subtitle")
                     .frame(maxWidth: .infinity)
             }
@@ -1114,7 +1128,7 @@ struct SourcesList: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Sources").font(.caption).foregroundColor(.secondary).padding(.horizontal, 12)
+            Text("Sources").font(.caption).bold().padding(.horizontal, 12)
             List(selection: $queue.selectedJobID) {
                 ForEach(queue.jobs) { job in
                     SourceRow(job: job).tag(job.id)
@@ -1122,6 +1136,7 @@ struct SourcesList: View {
             }
             .listStyle(.inset)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.top, 8)
     }
 }
@@ -1167,7 +1182,7 @@ struct TrackColumn: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(kind == "audio" ? "Audio" : "Subtitles")
-                .font(.caption).foregroundColor(.secondary)
+                .font(.caption).bold()
                 .padding(.horizontal, 12)
             if let job = queue.selectedJob {
                 TrackList(job: job, kind: kind)
@@ -1179,6 +1194,7 @@ struct TrackColumn: View {
             }
             Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.top, 8)
     }
 }

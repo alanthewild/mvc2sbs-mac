@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.63
+
+- **You can see where the columns are again.** A plain Divider is a hairline at
+  the system separator colour, which against an empty panel in dark mode is
+  invisible. The split is now an explicit rule with a grip in the middle that
+  brightens on hover, so it reads as both a boundary and something you can drag.
+- **The column headings sit at the left of their columns.** `.frame(width:)`
+  centres content narrower than the frame, and with nothing loaded the widest
+  thing in each column was the heading itself, so Audio and Subtitles floated in
+  the middle of empty space. They are bold now rather than grey too, so they
+  read as section titles.
+- The columns start as equal thirds, which is where 3.61 ended up. Picking
+  anything else was me deciding how wide your filenames are.
+
+
 ## 3.62
 
 - The movable divider is on the track panel, where it was wanted, not between
