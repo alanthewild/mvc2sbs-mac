@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.62
+
+- The movable divider is on the track panel, where it was wanted, not between
+  the file pane and the settings pane. That top split is back to a fixed third
+  and two thirds.
+- **Sources, Audio and Subtitles all have draggable widths now**, remembered
+  across restarts, with a double click on either divider putting that column
+  back to its default. How much room each needs depends on the disc: long
+  filenames want a wide Sources list, fourteen audio tracks want a wide middle,
+  and fixed thirds suit neither.
+- Each column has a minimum so a split saved on a wide display cannot leave one
+  unusable on a narrow one.
+
+
 ## 3.61
 
 - **mkvshrink lives here now.** It is a separate pipeline, not a 3D tool, but it

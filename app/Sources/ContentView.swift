@@ -10,19 +10,6 @@ struct ContentView: View {
     @EnvironmentObject var queue: QueueController
     @EnvironmentObject var defaults: DefaultsStore
     @State private var showSettings = false
-    /// Where the vertical divider sits, as a fraction of the window width.
-    /// @AppStorage so it survives a restart: a split you have to set every time
-    /// you open the app is barely better than a fixed one.
-    @AppStorage("leftPaneFraction") private var leftFraction: Double = 1.0 / 3.0
-    /// The width the drag started from. Translation is measured from where the
-    /// gesture began, so without this the pane jumps on every drag event.
-    @State private var dragBase: CGFloat? = nil
-
-    /// Clamped on the way out as well as on the way in, so a stored fraction
-    /// from a much wider window cannot leave one pane unusable.
-    private func paneWidth(in total: CGFloat) -> CGFloat {
-        min(max(260, total * CGFloat(leftFraction)), total * 0.62)
-    }
 
     var body: some View {
         // Both halves of this window are flexible, so left to itself SwiftUI
@@ -39,20 +26,13 @@ struct ContentView: View {
                                  advisory: queue.toolWarningIsAdvisory,
                                  onRecheck: { queue.refreshToolWarning() })
                 }
-                // A third and two thirds to start with. The divider between
-                // them is draggable and the position is remembered.
+                // The drop zone needs enough room to be an obvious target and
+                // no more. The settings panel is where the work happens, so it
+                // gets the other two thirds.
                 HStack(spacing: 0) {
                     DropZone()
-                        .frame(width: paneWidth(in: win.size.width))
-                    SplitHandle(
-                        onDrag: { dx in
-                            let base = dragBase ?? paneWidth(in: win.size.width)
-                            dragBase = base
-                            let w = min(max(260, base + dx), win.size.width * 0.62)
-                            leftFraction = Double(w / win.size.width)
-                        },
-                        onEnd: { dragBase = nil },
-                        onReset: { leftFraction = 1.0 / 3.0 })
+                        .frame(width: max(300, win.size.width / 3))
+                    Divider()
                     RightPanel()
                         .frame(maxWidth: .infinity)
                 }
@@ -1067,16 +1047,64 @@ struct FolderRow: View {
 
 // MARK: - Bottom: sources, audio, subtitles
 
+/// Sources, audio and subtitles, with both dividers draggable.
+///
+/// How much room each column needs depends entirely on what you are working
+/// with: long filenames want a wide Sources list, a disc with fourteen audio
+/// tracks wants a wide middle. Fixed thirds suit neither, so the split is
+/// yours and it is remembered.
 struct BottomPanel: View {
     @EnvironmentObject var queue: QueueController
 
+    @AppStorage("bottomSourcesFraction") private var sourcesFraction: Double = 0.37
+    @AppStorage("bottomAudioFraction") private var audioFraction: Double = 0.35
+    /// Where a drag started. Translation is measured from the start of the
+    /// gesture, so without this the columns jump on every drag event.
+    @State private var dragBase: CGFloat? = nil
+
+    private static let minSources: CGFloat = 240
+    private static let minAudio: CGFloat = 240
+    private static let minSubs: CGFloat = 200
+
+    /// Clamped on the way out as well as on the way in, so a split saved on a
+    /// wide display cannot leave a column unusable on a narrow one.
+    private func widths(_ total: CGFloat) -> (CGFloat, CGFloat) {
+        let room = max(total - 20, 1)          // the two grab handles
+        var src = min(max(BottomPanel.minSources, room * CGFloat(sourcesFraction)),
+                      room - BottomPanel.minAudio - BottomPanel.minSubs)
+        src = max(src, BottomPanel.minSources)
+        var aud = min(max(BottomPanel.minAudio, room * CGFloat(audioFraction)),
+                      room - src - BottomPanel.minSubs)
+        aud = max(aud, BottomPanel.minAudio)
+        return (src, aud)
+    }
+
     var body: some View {
-        HStack(spacing: 0) {
-            SourcesList().frame(minWidth: 320)
-            Divider()
-            TrackColumn(kind: "audio").frame(minWidth: 300)
-            Divider()
-            TrackColumn(kind: "subtitle").frame(minWidth: 240)
+        GeometryReader { geo in
+            HStack(spacing: 0) {
+                SourcesList()
+                    .frame(width: widths(geo.size.width).0)
+                SplitHandle(
+                    onDrag: { dx in
+                        let base = dragBase ?? widths(geo.size.width).0
+                        dragBase = base
+                        sourcesFraction = Double((base + dx) / max(geo.size.width - 20, 1))
+                    },
+                    onEnd: { dragBase = nil },
+                    onReset: { sourcesFraction = 0.37 })
+                TrackColumn(kind: "audio")
+                    .frame(width: widths(geo.size.width).1)
+                SplitHandle(
+                    onDrag: { dx in
+                        let base = dragBase ?? widths(geo.size.width).1
+                        dragBase = base
+                        audioFraction = Double((base + dx) / max(geo.size.width - 20, 1))
+                    },
+                    onEnd: { dragBase = nil },
+                    onReset: { audioFraction = 0.35 })
+                TrackColumn(kind: "subtitle")
+                    .frame(maxWidth: .infinity)
+            }
         }
     }
 }
