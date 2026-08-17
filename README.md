@@ -106,7 +106,8 @@ Check it on your own player with a one minute clip before committing hours:
 - Apple Silicon Mac, macOS 13 or later
 - Xcode Command Line Tools (`xcode-select --install`)
 - [Homebrew](https://brew.sh)
-- FFmpeg, and MKVToolNix if you want the 3D flag set on the output:
+- FFmpeg and MKVToolNix. Both are required: mvc2sbs refuses to start without
+  MKVToolNix, because a container FFmpeg wrote may not direct play at all.
   ```sh
   brew install ffmpeg mkvtoolnix
   ```
@@ -123,7 +124,8 @@ cd mvc2sbs-mac
 cd app && ./build-app.sh --install   # the Mac app into /Applications
 ```
 
-The app bundles `mvc2sbs`, `pgs3d.py` and the MVC decoder inside itself, so it
+The app bundles `mvc2sbs`, `pgs3d.py`, `mkvdiff`, `subs3d` and the MVC decoder
+inside itself, so it
 works even if you skip `install-mac3d.sh`. FFmpeg is always external.
 
 Those bundled tools are a snapshot taken at build time, so editing `mvc2sbs` in
@@ -166,11 +168,11 @@ than the whole stream.
 
 | Option | Meaning |
 | --- | --- |
-| `-q N` | CRF. 16 or 18 for archival use. |
+| `-q N` | CRF for x264 and x265. 20 is the measured recommendation. |
 | `-p P` | x264/x265 preset. `slow` by default. |
 | `--layout L` | `fsbs` (3840x1080, default), `hsbs`, `ftab`, `htab`. |
 | `--dark` | Dark gradient tuning. See [Banding](#banding). |
-| `--10bit` | 10-bit output. Pair with `--x265`, see the same section. |
+| `--10bit` | 10-bit output. Pair with `--x265` or `--vt`, never with x264. |
 | `--x265` | HEVC instead of AVC. |
 | `--vt` | Apple VideoToolbox HEVC. Fast, not CRF quality. |
 | `--sub-depth N` | Subtitle disparity in pixels. Positive is towards the viewer. |
@@ -207,7 +209,7 @@ take on trust.
 | `app/build-app.sh` | Builds the app with `swiftc`. No Xcode project. |
 | `app/make-icon.py` | Generates the icon. Needs Pillow, only if you change it. |
 | `app/MVC2SBS.icns` | The generated icon, committed so builds do not need Pillow. |
-| `tests/` | The test suite. Nine files, each written after a real fault. |
+| `tests/` | The test suite. Ten files, each written after a real fault. |
 
 The scripts have no file extension because they are meant to be run as commands.
 `file mvc2sbs` will confirm they are plain text.
@@ -241,8 +243,10 @@ wrote a given file.
 ```
 ffmpeg          copy the MVC track out as an Annex B .264 file
 edge264_test    decode base and dependent views, emit side-by-side Y4M
-ffmpeg/libx264  encode at CRF, mux the original audio, subtitles and chapters
-mkvpropedit     tag the result with StereoMode and per-eye display dimensions
+pgs3d.py        rebuild the PGS subtitles for the wider frame
+ffmpeg          encode to a staging file, with the original audio and subtitles
+mkvmerge        write the file you keep, carrying the chapters across
+mkvpropedit     tag it with StereoMode and 3840x2160 display dimensions
 ```
 
 Only the video is re-encoded. Audio is stream-copied. Subtitle bitmaps are
@@ -272,11 +276,30 @@ PGS subtitles are authored against a 1920 wide frame. Copy one unchanged onto a
 3840 wide side-by-side frame and it renders into the left eye only, which is why
 2D subtitle tracks look broken in 3D players.
 
-The fix needs no image processing. A PGS display set positions bitmaps using
-composition objects, and two composition objects may reference the same bitmap
-at different positions. So `pgs3d.py` duplicates each composition object into
-the second eye, widens the video descriptor and rewrites the window. The RLE
-bitmaps and palettes pass through byte for byte.
+The fix needs no pixel work, but it does need the bitmap rebuilt, and the
+reason is worth reading before you assume otherwise.
+
+A PGS display set positions bitmaps using composition objects, and the format
+allows several, so the obvious fix is to place the same bitmap twice. That is
+what this tool did first. FFmpeg draws every composition object, so VLC showed
+both copies and the files looked correct. ExoPlayer, which is what Jellyfin's
+Android TV client decodes PGS with, reads the position of composition object 0
+and ignores every one after it. The right eye was empty on the exact device
+these files are made for, and what looked like a subtitle there was crosstalk
+from the left.
+
+So `pgs3d.py` splices the two copies into one bitmap, emitted as one object with
+one composition object and one window, which any decoder can draw. The splice
+works on RLE run boundaries rather than pixels: rows are cut apart, transparent
+runs inserted between the copies, and the original bytes replayed verbatim.
+Nothing is decoded or re-encoded, palettes pass through untouched, and a feature
+length track converts in about a second and a half.
+
+Check any file without watching it:
+
+```sh
+mkvdiff --subs FILE
+```
 
 This happens automatically on the `fsbs` and `ftab` layouts. The half layouts
 would need the bitmaps rescaled, which is not implemented, so they keep the
@@ -308,10 +331,57 @@ they were:
 | 0.85 | 16, 72, 123, 169, 205, 235 |
 | 0.70 | 16, 87, 137, 179, 210, 235 |
 
-An honest note on the underlying cause: on a 1080p 3D TV, frame-compatible SBS
-gives each eye 960 pixels of horizontal detail no matter what, because the panel
-has to fit both eyes into one 1920 wide frame. Full SBS is worth keeping as an
-archive for a future 4K display, but it is not buying you resolution today.
+An earlier version of this file claimed each eye only ever gets 960 pixels of
+horizontal detail on a 1080p 3D TV. That is wrong, and it came from misusing the
+word "frame-compatible".
+
+**Frame-compatible** means both views squeezed into one frame of an existing
+standard size, so they travel through equipment that knows nothing about 3D.
+Half-SBS is frame-compatible: 1920x1080 total, 960x1080 per eye. Half-TAB is
+too, at 1920x540 per eye. Broadcasters used these because they fit 1080p
+infrastructure unchanged, and they are the reason "3D looks soft" is a common
+memory.
+
+Full SBS is not frame-compatible. It is 3840x1080, a full 1920x1080 per eye,
+which is exactly what a 3D Blu-ray carries and exactly what a Blu-ray player
+sends a TV over HDMI 1.4 frame packing. Nothing is thrown away, and an
+active-shutter 1080p 3D TV shows each eye a full 1920x1080 picture.
+
+That full resolution is the whole point of this layout, and it is also why
+support is patchy: 3840x1080 is not a resolution hardware decoders were designed
+around, so some players direct play it and others transcode. Measured so far:
+Kodi and Jellyfin direct play it, Plex does not.
+
+### Adding subtitles to a film that has none
+
+Everything above is about subtitles a disc already carries. `subs3d` is for the
+other case: you have a Full-SBS film with no subtitles and an SRT or an ASS.
+
+```sh
+subs3d dialogue.srt --depth 20 --mux "Film.3D-fsbs.mkv"
+```
+
+A player draws an ordinary subtitle once, across the whole frame, so on a
+side-by-side file each eye gets half the sentence. This writes every line twice,
+centred in each eye, and `--mux` puts the result in the film with mkvmerge.
+Nothing is re-encoded, so it takes minutes.
+
+It writes **both formats by default**, because no single one plays everywhere
+and the player can pick:
+
+| Format | Where it works | Where it does not |
+| --- | --- | --- |
+| PGS | Everywhere a disc's own subtitles work, including direct play on a Shield. The typeface is baked into the bitmaps, so no font is needed on the player. | Some browser and smart TV clients, which transcode anyway. |
+| ASS | VLC, mpv, Kodi, Infuse. Small, and the player can restyle it. | ExoPlayer's support is partial, so Jellyfin may ignore the positioning or burn it in. |
+
+`--format pgs` or `--format ass` writes just one. `--depth N` sets disparity in
+pixels: positive brings the subtitles towards you, which stops them colliding
+with anything popping out of the screen, and 20 to 40 is a sensible range.
+
+Two things to know. The PGS renderer needs FFmpeg built with libass, and `--mux`
+needs ffprobe and mkvmerge; without `--mux` it needs nothing but python3. And
+the font named in an ASS has to exist on whatever plays the film, not on the Mac
+that made it, which is why the default is Arial.
 
 ## Player compatibility
 
@@ -327,6 +397,7 @@ output to a Panasonic VT60 plasma.
 | HEVC Main, 8-bit, 3840x1080, x265 | plays |
 | HEVC Main 10, 3840x1080, x265 | plays |
 | HEVC Main, 3840x1080, VideoToolbox | plays |
+| HEVC Main 10, 3840x1080, VideoToolbox | plays, and is the default |
 
 All of it plays. Earlier versions of this file said the opposite, and that was
 wrong.
@@ -404,8 +475,8 @@ badly here and that result should not be trusted for real footage.
 ### The cost of 10-bit at 3840x1080
 
 Before spending time here, check [Player compatibility](#player-compatibility).
-On at least one common setup none of the HEVC options play at all, which makes
-the speed question academic.
+Every HEVC variant direct plays on the setup this was measured on, so the real
+question is speed.
 
 Measured on an M1 Pro, encoding the same content:
 
@@ -420,43 +491,65 @@ Silicon media engine at around 100 fps and does support 10-bit, so it sidesteps
 the speed problem entirely. It is quality-targeted rather than CRF, so it needs
 more bits for the same result.
 
-`--10bit` is the bigger win for banding, but whether the result plays is the
-problem, and the honest answer is that it often does not.
+`--10bit` is the bigger win for banding, and on the one setup this has been
+tested against it plays.
 
-`--10bit` alone produces H.264 High 10, which no NVIDIA hardware decoder has ever
-supported and which most TVs and set-top boxes reject. Pairing it with `--x265`
-or `--vt` produces HEVC, which the spec sheets say should be widely decoded. In
-practice, on the one setup this has been tested against, no HEVC variant at
-3840x1080 played at all. See [Player compatibility](#player-compatibility).
+The codec it is paired with is what matters. `--10bit` alone produces H.264 High
+10, which no NVIDIA hardware decoder has ever supported and which most TVs and
+set-top boxes reject: a 2017 Shield refuses it, Jellyfin reports "the video
+codec's profile is not supported", and the transcode it falls back to also
+mangles the aspect ratio. Paired with `--x265` or `--vt` it produces HEVC Main
+10, which direct plays. See [Player compatibility](#player-compatibility).
 
-Treat 10-bit as unproven on your hardware until you have played a 60 second clip
-on the actual player. If it does not work, `--dark` at 8-bit recovers most of the
-benefit and plays everywhere.
+So: 10-bit yes, but never with x264.
+
+An earlier version of this file said no HEVC variant played at all. That was
+wrong, and the story of how is worth reading, because the mistake was in the
+method rather than the measurement. See the same section.
+
+Still worth building a 60 second clip and playing it on your own hardware before
+committing hours. `--dark` is not the fallback it once was: measured on a
+dithered dark ramp it is worth 5 to 8 points of dither retention at 8-bit and
+essentially nothing at 10-bit, where it costs 20 to 40% more bits for no
+measurable gain.
 
 ## StereoMode and display dimensions
 
-Matroska defines `DisplayWidth`/`DisplayHeight` as the dimensions of **one eye**
-when `StereoMode` is set, not the packed frame. From the specification notes:
-"the pixel count of the track is the raw number of pixels (for example, 3840x1080
-for full HD side by side), and the DisplayWidth/DisplayHeight in pixels is the
-number of pixels for one plane".
-
-Setting StereoMode without setting the display size leaves it at the packed
+Setting `StereoMode` without setting the display size leaves it at the packed
 3840x1080, so a compliant reader concludes each 1920 wide eye should display
-3840 wide, derives a 2:1 sample aspect and stretches the picture to 64:9:
+3840 wide, derives a 2:1 sample aspect and stretches the picture to 64:9. Both
+have to be set.
 
-| Tagging | Sample aspect | Display aspect |
-| --- | --- | --- |
-| No StereoMode | 1:1 | 32:9 |
-| StereoMode only | 2:1 | 64:9, wrong |
-| StereoMode plus display size | 1:1 | 32:9 |
+What to set them to is covered in
+[StereoMode display dimensions](#stereomode-display-dimensions) further down,
+and the answer is not the one a plain reading of the spec gives. The
+specification notes say `DisplayWidth`/`DisplayHeight` are the dimensions of one
+plane, which would be 1920x1080. Writing that produces a file Jellyfin on a
+Shield refuses to start. 3840x2160 is what works and what BD3D2MK3D has written
+for years.
 
 To repair a file made by another tool, no re-encode needed:
 
 ```sh
 mkvpropedit file.mkv --edit track:v1 \
-  --set stereo-mode=1 --set display-width=1920 --set display-height=1080
+  --set stereo-mode=1 --set display-width=3840 --set display-height=2160
 ```
+
+## Subtitle timing, and why .sup inputs need an offset
+
+FFmpeg rebases every input file so that its own first timestamp becomes zero.
+The rebuilt subtitle files are separate inputs, so a film whose first subtitle is
+44 seconds in had its entire subtitle track shifted 44 seconds early.
+
+Nothing about the resulting file looks wrong under any structural check. The
+container is valid, the track is present, the count is right. It was found by
+watching Avatar.
+
+Every rebuilt `.sup` is therefore passed with `-itsoffset` equal to its own
+`start_time`, which puts back exactly what FFmpeg is about to subtract. Measured
+against a synthetic `.sup` starting at 44s: 0.000 without it, 44.000 with it.
+The first subtitle in the output is compared against the first in the rebuilt
+track after every encode, and a drift above one second is a warning.
 
 ## Colour tagging
 
@@ -532,8 +625,9 @@ else, and watching it start. BD3D2MK3D has always muxed with mkvmerge, which is
 why files from it never showed the problem.
 
 The cost is rewriting the file once at the end of the encode: minutes against
-hours. Without mkvtoolnix installed, FFmpeg's file is kept and the limitation is
-stated rather than hidden.
+hours. Without mkvtoolnix installed `mvc2sbs` refuses to start, rather than
+spending an encode on a container that may not play. `MVC2SBS_ALLOW_FFMPEG_MUX=1`
+overrides that for anyone who genuinely wants FFmpeg's file.
 
 ## Inverted depth
 
@@ -618,8 +712,8 @@ anything else muxed with mkvmerge have never shown this.
 
 So `mvc2sbs` passes `-map_chapters -1` to FFmpeg and hands the chapters to
 `mkvmerge` during the remux above, stripping `ChapterTimeEnd` on the way
-through. This needs mkvtoolnix installed; without it the output simply has no
-chapters and says so.
+through. This needs mkvtoolnix installed, and `mvc2sbs` checks before any work
+starts rather than discovering it after a three hour encode.
 
 Check any file with:
 
@@ -668,6 +762,13 @@ mkvdiff --quality t-q18.mkv t-q20.mkv
 Pick the section deliberately. A film's opening is usually its cheapest minute,
 and settings that look identical there can diverge badly in motion. `mkvdiff
 --peak SOURCE.mkv` shows where the expensive parts are.
+
+And one that cost the most time of anything in this project: **two faults at
+once will make a correct single-variable test look like an exoneration.** The
+chapter fault was tested in isolation, cleanly, and cleared, because the
+display-dimension fault was still there underneath it and producing the same
+symptom. If a change that should have worked did not, consider that you may be
+looking at two things rather than one.
 
 ## x265 or VideoToolbox
 
@@ -845,7 +946,7 @@ chapters. See the chapters section above.
 
 ```sh
 python3 tests/test_pgs3d.py    # builds a synthetic PGS stream and verifies it
-shellcheck -S warning mvc2sbs mkvdiff install-mac3d.sh app/build-app.sh
+shellcheck -S warning mvc2sbs mkvdiff mkvshrink install-mac3d.sh app/build-app.sh
 cd app && ./build-app.sh       # builds the app, fetching the decoder if needed
 python3 -m pip install pillow  # only needed to regenerate the icon
 python3 app/make-icon.py       # regenerates MVC2SBS.icns

@@ -1,5 +1,36 @@
 # Changelog
 
+## 3.66
+
+- **The README had gone stale in twelve places and one of them would break a
+  file.** The old "StereoMode and display dimensions" section still told you to
+  set `display-width=1920 --display-height=1080`, which is exactly the value
+  that makes Jellyfin on a Shield refuse to start a file. It now agrees with the
+  section further down that has said 3840x2160 since it was measured.
+- **"No HEVC variant plays at 3840x1080" survived in two more places** after the
+  verdict was withdrawn, including at the head of the 10-bit section where it
+  told you not to bother reading on.
+- **The frame-compatible passage was wrong twice.** It called Full SBS
+  frame-compatible, which it is not, and concluded each eye only ever gets 960
+  pixels of horizontal detail on a 1080p 3D TV, which is false. Frame-compatible
+  means Half-SBS and Half-TAB, squeezed into an existing 1080p frame. Full SBS
+  carries a complete 1920x1080 per eye, the same as a 3D Blu-ray over HDMI 1.4
+  frame packing. That is the point of it, and it is also why direct play support
+  is patchy: Kodi and Jellyfin manage 3840x1080, Plex does not.
+- The 3D subtitle section still described duplicating the composition object,
+  the approach that renders in the left eye only on a Shield. The pipeline
+  diagram had FFmpeg muxing the output and writing chapters, neither of which it
+  has done for many versions, and per-eye display dimensions. MKVToolNix was
+  described as optional when the script refuses to start without it. The options
+  table recommended CRF 16 or 18 and told you to pair 10-bit with x265 only.
+- **subs3d is documented**, with the two formats, when each fails, and its
+  dependencies. So is the `-itsoffset` rule, which had never made it out of the
+  changelog.
+- NEW-TOOL-BRIEF.md is deleted. mkvshrink exists, so a design brief for it is
+  something to be misled by rather than informed. The one lesson in it that was
+  not already in the README moved there first.
+
+
 ## 3.65
 
 - **The top and bottom panes are back exactly as they were before 3.59.**
