@@ -27,7 +27,7 @@ VERSION="3.26"
 # iteration that is eight different scripts all claiming 3.26. BUILD is what
 # tells you which of them wrote a given file, and it is stamped into the
 # output for exactly that reason.
-BUILD="18"
+BUILD="22"
 
 # ------------------------------- defaults ----------------------------------
 ENCODER=vt            # vt | x265
@@ -57,6 +57,8 @@ CALIBRATE=""
 CALIBRATE_AT=""
 CALIBRATE_LEN=60
 KEEPCLIPS=0
+LUMAPROF=""
+LUMA_SAMPLES=120
 DARKEST=1
 INTERACTIVE=0
 ATRACKS=""
@@ -104,6 +106,12 @@ Options
                         hunting for the darkest scene. Dark scenes are where
                         banding and crushed blacks show, so that is where the
                         clip is taken from by default.
+      --luma FILE       profile how much of the luma range a film uses, without
+                        encoding anything. Dark alone is not what causes
+                        banding: a dark frame spanning a wide range has room to
+                        spare. Dark and narrow together is the risk, and this
+                        reports what share of the film is both.
+      --luma-samples N  frames to sample for --luma (default $LUMA_SAMPLES)
       --keep-clips      keep the calibration clips instead of deleting them, so
                         the encodes can be compared by eye. PSNR and SSIM do not
                         see banding or black crush; looking at the file does.
@@ -237,6 +245,8 @@ while [[ $# -gt 0 ]]; do
     --calibrate-at)    CALIBRATE_AT="$2"; shift 2 ;;
     --calibrate-len)   CALIBRATE_LEN="$2"; shift 2 ;;
     --keep-clips)      KEEPCLIPS=1; shift ;;
+    --luma)            LUMAPROF="$2"; shift 2 ;;
+    --luma-samples)    LUMA_SAMPLES="$2"; shift 2 ;;
     --no-darkest)      DARKEST=0; shift ;;
     --x265)            ENCODER=x265; shift ;;
     --vt-quality)      VTQUALITY="$2"; shift 2 ;;
@@ -1546,6 +1556,13 @@ plan_row() {  # emits one TSV row for the current probe state
 # analyse FILE -> fills D_ACTION, PLAN_*
 analyse() {
   local f="$1"
+  # Clear the probe results before every file. These are globals, and a file
+  # that is skipped never reaches probe_encode, so without this it reports the
+  # numbers belonging to the last file that was probed. In a plan that shows up
+  # as fifteen consecutive rows sharing one PSNR, which reads as a measurement
+  # rather than as the absence of one.
+  PE_RATIO=""; PE_PSNR=""; PE_SSIM=""; PE_PROBES=0
+  AUDIO_LOST_LANGS=""; AUDIO_KEEP_LANGS=""
   probe_file "$f"
   if [[ "$P_OK" != "1" ]]; then
     D_ACTION="skip"; D_REASON="${P_ERR:-unreadable}"
@@ -1613,11 +1630,7 @@ overhead = max(0, total - vid - other - drop)
 pred = int(vid * ratio) + other + overhead
 print("%d %.1f" % (pred / 1048576, 100.0 * (total - pred) / total))
 ' "${VID_BYTES:-0}" "${KEEP_OTHER_BYTES:-0}" "${TOTAL_BYTES:-0}" "$PE_RATIO" "${DROP_BYTES:-0}")"
-      # The window count belongs in this line. PE_PSNR is the worst of the
-      # windows, so a prediction drawn from one surviving window is a much
-      # weaker claim than the same numbers drawn from three, and nothing else
-      # in the output would tell you which you were looking at.
-      say "$(basename "$f"): probe ratio ${PE_RATIO}, PSNR ${PE_PSNR:-?} dB, SSIM ${PE_SSIM:-?}, predicted saving ${PLAN_SAVE}% (from ${PE_PROBES:-?} probe window(s))"
+      say "$(basename "$f"): probe ratio ${PE_RATIO}, PSNR ${PE_PSNR:-?} dB, SSIM ${PE_SSIM:-?}, predicted saving ${PLAN_SAVE}%"
       # A quality floor is worth more than a size floor. An encode that passes
       # every structural check and still looks like mush is the failure the
       # exit status cannot see.
@@ -1744,6 +1757,7 @@ print("%02d:%02d:%06.3f" % (h, m, t - h * 3600 - m * 60))' "$darkat" "$CALIBRATE
   # Cut once, and encode that. A seek option on the full source snaps to a
   # keyframe, so two runs can start on different frames and still produce a
   # confident looking PSNR.
+  say "mkvshrink $VERSION build $BUILD, $(plan_settings_line)"
   say "Cutting a ${CALIBRATE_LEN}s clip at $at"
   mkvmerge -q -o "$clip" --no-audio --no-subtitles --no-chapters \
     --no-global-tags --no-track-tags --split "parts:${at}-${endt}" "$f" >/dev/null
@@ -1800,6 +1814,92 @@ print("%02d:%02d:%06.3f" % (h, m, t - h * 3600 - m * 60))' "$darkat" "$CALIBRATE
   matters is where the curve flattens: above that point you are spending bits
   preserving the previous encoder's artefacts.
 EOF
+}
+
+# --luma: sample the picture across a film and report how much of the code
+# range it actually uses. Banding is not caused by darkness as such, it is
+# caused by crowding: if most of a frame sits between luma 16 and 60 then about
+# 44 code values are carrying the whole picture, and re-quantising them shows
+# as steps. YAVG alone cannot see that, because a dark frame that still spans a
+# wide range has plenty of room. YHIGH-YLOW is the span that matters, and the
+# fraction of frames where that span is narrow is the number worth comparing
+# between films.
+luma_profile() {
+  local f="$1"
+  probe_file "$f"
+  [[ "$P_OK" == "1" ]] || die "cannot read $f"
+  local dur="${DURATION:-0}"
+  python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 60 else 1)' "$dur" \
+    || die "too short to profile"
+  local n="${LUMA_SAMPLES}"
+  say "mkvshrink $VERSION build $BUILD"
+  # signalstats reports in the source bit depth, so a 10-bit file comes back on
+  # a 0-1023 scale. Comparing that against thresholds written for 0-255 makes a
+  # 10-bit film look four times wider than it is, and every file this tool
+  # produces is 10-bit.
+  local depth=255
+  [[ "${IS_10BIT:-0}" == "1" ]] && depth=1023
+  say "Sampling $n frames across $(basename "$f") ($([[ $depth -eq 1023 ]] && echo 10-bit || echo 8-bit))"
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.luma.XXXXXX")"
+  local i pts vals
+  i=0
+  while [[ $i -lt $n ]]; do
+    # Spread across the body of the film. The first and last few percent are
+    # titles and credits, which are not representative of anything.
+    pts="$(python3 -c '
+import sys
+dur, i, n = float(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+frac = 0.03 + (0.94 * i / max(1, n - 1))
+print("%.3f" % (dur * frac))' "$dur" "$i" "$n")"
+    vals="$(ffmpeg -hide_banner -nostdin -ss "$pts" -i "$f" -frames:v 1 \
+      -vf signalstats,metadata=print -f null - 2>&1 \
+      | grep -oE 'signalstats\.(YMIN|YLOW|YAVG|YHIGH|YMAX)=[0-9.]+' \
+      | cut -d= -f2 | tr '\n' ' ')"
+    [[ -n "$vals" ]] && printf '%s %s\n' "$pts" "$vals" >> "$tmp"
+    i=$((i + 1))
+    printf '\r\033[K  %d/%d' "$i" "$n" >&2
+  done
+  printf '\r\033[K' >&2
+  python3 -c '
+import sys
+rows = []
+for line in open(sys.argv[1]):
+    p = line.split()
+    if len(p) >= 6:
+        rows.append([float(x) for x in p[:6]])
+if not rows:
+    print("no samples"); raise SystemExit(1)
+depth = float(sys.argv[2]) if len(sys.argv) > 2 else 255.0
+scale = 255.0 / depth
+for r in rows:
+    for i in range(1, 6):
+        r[i] *= scale
+rows.sort(key=lambda r: r[3])
+n = len(rows)
+
+def pct(vals, q):
+    v = sorted(vals)
+    return v[min(len(v) - 1, int(q * len(v)))]
+
+yavg = [r[3] for r in rows]
+span = [r[4] - r[2] for r in rows]          # YHIGH - YLOW
+narrow = sum(1 for s in span if s < 60)
+dark = sum(1 for v in yavg if v < 60)
+both = sum(1 for r in rows if (r[4] - r[2]) < 60 and r[3] < 60)
+print("  samples            %d" % n)
+print("  YAVG   min/med/max %.0f / %.0f / %.0f" % (min(yavg), pct(yavg, 0.5), max(yavg)))
+print("  span   min/med/max %.0f / %.0f / %.0f   (YHIGH-YLOW, of 255)" % (
+    min(span), pct(span, 0.5), max(span)))
+print("  frames below YAVG 60      %d%%" % (100 * dark // n))
+print("  frames with span under 60 %d%%" % (100 * narrow // n))
+print("  both dark and narrow      %d%%   <- banding risk" % (100 * both // n))
+print()
+print("  darkest samples:")
+for r in rows[:5]:
+    print("    %8.1fs  YAVG %5.1f  YLOW %3.0f  YHIGH %3.0f  span %3.0f"
+          % (r[0], r[3], r[2], r[4], r[4] - r[2]))
+' "$tmp" "$depth"
+  rm -f "$tmp"
 }
 
 # Echoes the start time, in seconds, of the darkest sampled point. Uses
@@ -1919,6 +2019,11 @@ apply_plan() {
 }
 
 # ---------------------------- main ------------------------------------------
+if [[ -n "$LUMAPROF" ]]; then
+  luma_profile "$LUMAPROF"
+  exit 0
+fi
+
 if [[ -n "$CALIBRATE" ]]; then
   do_calibrate "$CALIBRATE"
   exit 0
