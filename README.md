@@ -204,12 +204,13 @@ take on trust.
 | `mkvdiff` | The diagnostic comparison tool. Also a bash script. |
 | `subs3d` | Builds 3D subtitles, PGS and ASS, from an SRT or an ASS. |
 | `mkvshrink` | Re-encodes H.264 libraries to HEVC to reclaim disk. |
+| `docs/` | mkvshrink's own README and its status report. |
 | `install-mac3d.sh` | Installs the Homebrew dependencies and builds the decoder. |
 | `app/Sources/*.swift` | The Mac app, five files. |
 | `app/build-app.sh` | Builds the app with `swiftc`. No Xcode project. |
 | `app/make-icon.py` | Generates the icon. Needs Pillow, only if you change it. |
 | `app/MVC2SBS.icns` | The generated icon, committed so builds do not need Pillow. |
-| `tests/` | The test suite. Ten files, each written after a real fault. |
+| `tests/` | The test suite. Eleven files, each written after a real fault. |
 
 The scripts have no file extension because they are meant to be run as commands.
 `file mvc2sbs` will confirm they are plain text.
@@ -225,18 +226,32 @@ upstream, its licence is BSD, and its copyright notice is reproduced in
 
 A second pipeline in the same repository, and not a 3D tool. It re-encodes
 existing H.264 files to HEVC to reclaim disk, dropping the audio and subtitle
-tracks you will never play. It is here rather than in its own repository
-because it inherits every rule this project paid for: mux with MKVToolNix and
-never FFmpeg, never let FFmpeg write chapters, preserve StereoMode and display
-dimensions, check the output before touching the original, and stamp
-provenance into the file. Some of the files it will be pointed at are the
-side-by-side conversions `mvc2sbs` produced, so those rules are not optional.
+tracks you will never play.
 
-It carries its own version and build number rather than sharing the one the 3D
-tools move together on. They are separate pipelines with separate release
-cadences, and a shared number would have to be bumped whenever either changed,
-which makes it useless for the one job a version has: telling you which script
-wrote a given file.
+```sh
+mkvshrink --keep-originals film.mkv            # one file, original untouched
+mkvshrink --plan plan.tsv /Volumes/Media       # review before committing
+mkvshrink --apply plan.tsv
+```
+
+It is here rather than in its own repository because it inherits every rule this
+project paid for: mux with MKVToolNix and never FFmpeg, never let FFmpeg write
+chapters, preserve StereoMode and display dimensions, check the output before
+touching the original, and stamp provenance into the file. Some of the files it
+will be pointed at are the side-by-side conversions `mvc2sbs` produced.
+
+Two documents rather than a section here, because it has enough of its own:
+
+- **[docs/mkvshrink.md](docs/mkvshrink.md)** is how to use it, what the gates
+  are, why PSNR is not a quality gate, and what `--luma` is for.
+- **[docs/mkvshrink-status.md](docs/mkvshrink-status.md)** is what is proven,
+  what is untested, and which conclusions rest on measurement. Read this one
+  first if you are about to point it at a library. It says plainly that
+  `--in-situ` has never been run and that no 3D file has been through the tool.
+
+It shares the repository version, and carries its own `BUILD` number on top,
+stamped into every output file. A release version alone cannot tell you which of
+eight scripts written in one afternoon produced a given file.
 
 ## How it works
 

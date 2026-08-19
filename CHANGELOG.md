@@ -1,5 +1,45 @@
 # Changelog
 
+## 3.68
+
+**mkvshrink is merged properly.** It arrived in 3.61 as a script dropped into
+the repository. This is the rest of it: docs, tests, and a version that means
+something.
+
+- **It joins the release line.** It was developed against its own numbering and
+  turned up at 3.26 while this repository was at 3.67, which is precisely the
+  ambiguity a version number exists to remove. It is 3.68 now, like everything
+  else. `BUILD` keeps counting on its own and is still stamped into every
+  output file, because it answers a different question: which of the eight
+  scripts written in one afternoon produced this. That was the right idea and
+  it makes a shared VERSION cost nothing.
+- **`tests/test_mkvshrink.py`**, which was the last item on its own blocking
+  list. The pipeline needs real media and is not testable here. The decisions
+  are: the probe stage is lifted out of the script and run against synthetic
+  mkvmerge and ffprobe JSON, so it is the same text that ships. It covers the
+  promises the documentation makes, including the audio hole it admits to,
+  asserted as it behaves rather than as anyone would like.
+- **Two things that test found.** The audio fallback for "no track matched the
+  rules" can never fire, because the rule above it keeps the first audio track
+  whatever its language, so the selection is never empty. It is asserted as
+  unreachable, so the day the first-track rule changes, the guard starts
+  mattering and the test says so. And `PE_PROBES` was still counting surviving
+  probe windows and still never being read, in build 24 as in build 18; the
+  count is in the report line now, which matters because the reported PSNR is
+  the worst window rather than the mean.
+- **`docs/mkvshrink.md`** is the tool's own README, kept whole rather than
+  compressed into the main one, and **`docs/mkvshrink-status.md`** is its
+  honest account of what is proven, what is untested and which conclusions rest
+  on measurement. That second document is worth more than the first. It says
+  plainly that `--in-situ` has never been run, that no 3D SBS file has been
+  through the tool, and that PSNR failed as a quality predictor in three cases
+  out of four.
+- Everything from the 3.26 notes is preserved in those two documents: the
+  pipeline, the modes, the track rules, the replacement behaviour, and the
+  reasoning behind probe seeking, frame-index PSNR pairing, the saving gate and
+  worst-window reporting.
+
+
 ## 3.67
 
 - The subs3d help entries were in Credits as well as in "What is in the box".

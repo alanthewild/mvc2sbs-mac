@@ -73,6 +73,9 @@ jobs:
       - name: Help index is well formed
         run: python3 tests/test_help_index.py
 
+      - name: mkvshrink track selection
+        run: python3 tests/test_mkvshrink.py
+
   build-app:
     name: Build the macOS app
     runs-on: macos-14

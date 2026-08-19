@@ -21,13 +21,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-VERSION="3.26"
+VERSION="3.68"
 # Increments on every build handed over, including ones that never reach a
 # release. VERSION alone answers "which release", and during a week of
 # iteration that is eight different scripts all claiming 3.26. BUILD is what
 # tells you which of them wrote a given file, and it is stamped into the
 # output for exactly that reason.
-BUILD="22"
+BUILD="24"
 
 # ------------------------------- defaults ----------------------------------
 ENCODER=vt            # vt | x265
@@ -56,6 +56,7 @@ APPLYIN=""
 CALIBRATE=""
 CALIBRATE_AT=""
 CALIBRATE_LEN=60
+CALIBRATE_ROWS=""
 KEEPCLIPS=0
 LUMAPROF=""
 LUMA_SAMPLES=120
@@ -102,15 +103,23 @@ Options
                         measured on 3840x1080 3D and do not transfer.
       --calibrate-at T  where to cut the calibration clip (default: 40% in)
       --calibrate-len N seconds of calibration clip (default $CALIBRATE_LEN)
+      --calibrate-rows LIST
+                        which encodes to test, comma separated, as enc:value.
+                        Default: vt:55,vt:62,vt:65,vt:70,x265:20,x265:18
+                        Example: --calibrate-rows x265:16,x265:14
+                        The global --x265 and --crf do not affect calibration;
+                        this is the knob that does.
       --no-darkest      cut the calibration clip at the midpoint rather than
                         hunting for the darkest scene. Dark scenes are where
                         banding and crushed blacks show, so that is where the
                         clip is taken from by default.
-      --luma FILE       profile how much of the luma range a film uses, without
+      --luma PATH       profile how much of the luma range a film uses, without
                         encoding anything. Dark alone is not what causes
                         banding: a dark frame spanning a wide range has room to
                         spare. Dark and narrow together is the risk, and this
-                        reports what share of the film is both.
+                        reports what share of the film is both. Given a folder,
+                        profiles every file and prints a table sorted by risk,
+                        so a library can be triaged in one pass.
       --luma-samples N  frames to sample for --luma (default $LUMA_SAMPLES)
       --keep-clips      keep the calibration clips instead of deleting them, so
                         the encodes can be compared by eye. PSNR and SSIM do not
@@ -244,6 +253,7 @@ while [[ $# -gt 0 ]]; do
     --calibrate)       CALIBRATE="$2"; shift 2 ;;
     --calibrate-at)    CALIBRATE_AT="$2"; shift 2 ;;
     --calibrate-len)   CALIBRATE_LEN="$2"; shift 2 ;;
+    --calibrate-rows)  CALIBRATE_ROWS="$2"; shift 2 ;;
     --keep-clips)      KEEPCLIPS=1; shift ;;
     --luma)            LUMAPROF="$2"; shift 2 ;;
     --luma-samples)    LUMA_SAMPLES="$2"; shift 2 ;;
@@ -1630,7 +1640,11 @@ overhead = max(0, total - vid - other - drop)
 pred = int(vid * ratio) + other + overhead
 print("%d %.1f" % (pred / 1048576, 100.0 * (total - pred) / total))
 ' "${VID_BYTES:-0}" "${KEEP_OTHER_BYTES:-0}" "${TOTAL_BYTES:-0}" "$PE_RATIO" "${DROP_BYTES:-0}")"
-      say "$(basename "$f"): probe ratio ${PE_RATIO}, PSNR ${PE_PSNR:-?} dB, SSIM ${PE_SSIM:-?}, predicted saving ${PLAN_SAVE}%"
+      # The window count belongs in this line. The reported PSNR is the WORST
+      # of the sampled windows, so a number drawn from one surviving window is
+      # a much weaker claim than the same number drawn from three, and nothing
+      # else in the output would tell you which you were looking at.
+      say "$(basename "$f"): probe ratio ${PE_RATIO}, PSNR ${PE_PSNR:-?} dB, SSIM ${PE_SSIM:-?}, predicted saving ${PLAN_SAVE}% (from ${PE_PROBES:-?} probe window(s))"
       # A quality floor is worth more than a size floor. An encode that passes
       # every structural check and still looks like mush is the failure the
       # exit status cannot see.
@@ -1770,7 +1784,17 @@ print("%02d:%02d:%06.3f" % (h, m, t - h * 3600 - m * 60))' "$darkat" "$CALIBRATE
 
   local saveenc="$ENCODER" saveq="$VTQUALITY" savecrf="$CRF"
   local spec
-  for spec in "vt:55" "vt:62" "vt:65" "vt:70" "x265:20" "x265:18"; do
+  # Settable, because the useful rows depend on what is being investigated.
+  # The default sweeps the range; chasing a specific failure means testing
+  # specific settings, and a fixed list silently ignored --crf and --x265.
+  local -a specs
+  if [[ -n "$CALIBRATE_ROWS" ]]; then
+    local _r
+    for _r in ${CALIBRATE_ROWS//,/ }; do specs+=("$_r"); done
+  else
+    specs=("vt:55" "vt:62" "vt:65" "vt:70" "x265:20" "x265:18")
+  fi
+  for spec in "${specs[@]}"; do
     local kind="${spec%%:*}" val="${spec##*:}"
     ENCODER="$kind"
     [[ "$kind" == "vt" ]] && VTQUALITY="$val" || CRF="$val"
@@ -1824,22 +1848,23 @@ EOF
 # wide range has plenty of room. YHIGH-YLOW is the span that matters, and the
 # fraction of frames where that span is narrow is the number worth comparing
 # between films.
-luma_profile() {
-  local f="$1"
+# Emits one summary line: risk dark narrow yavg_med span_med depth
+luma_measure() {
+  local f="$1" quiet="${2:-0}"
   probe_file "$f"
   [[ "$P_OK" == "1" ]] || die "cannot read $f"
   local dur="${DURATION:-0}"
   python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 60 else 1)' "$dur" \
     || die "too short to profile"
   local n="${LUMA_SAMPLES}"
-  say "mkvshrink $VERSION build $BUILD"
   # signalstats reports in the source bit depth, so a 10-bit file comes back on
   # a 0-1023 scale. Comparing that against thresholds written for 0-255 makes a
   # 10-bit film look four times wider than it is, and every file this tool
   # produces is 10-bit.
   local depth=255
   [[ "${IS_10BIT:-0}" == "1" ]] && depth=1023
-  say "Sampling $n frames across $(basename "$f") ($([[ $depth -eq 1023 ]] && echo 10-bit || echo 8-bit))"
+  [[ "$quiet" == "1" ]] || \
+    say "Sampling $n frames across $(basename "$f") ($([[ $depth -eq 1023 ]] && echo 10-bit || echo 8-bit))"
   local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.luma.XXXXXX")"
   local i pts vals
   i=0
@@ -1857,9 +1882,9 @@ print("%.3f" % (dur * frac))' "$dur" "$i" "$n")"
       | cut -d= -f2 | tr '\n' ' ')"
     [[ -n "$vals" ]] && printf '%s %s\n' "$pts" "$vals" >> "$tmp"
     i=$((i + 1))
-    printf '\r\033[K  %d/%d' "$i" "$n" >&2
+    [[ "$quiet" == "1" ]] || printf '\r\033[K  %d/%d' "$i" "$n" >&2
   done
-  printf '\r\033[K' >&2
+  [[ "$quiet" == "1" ]] || printf '\r\033[K' >&2
   python3 -c '
 import sys
 rows = []
@@ -1886,6 +1911,11 @@ span = [r[4] - r[2] for r in rows]          # YHIGH - YLOW
 narrow = sum(1 for s in span if s < 60)
 dark = sum(1 for v in yavg if v < 60)
 both = sum(1 for r in rows if (r[4] - r[2]) < 60 and r[3] < 60)
+if len(sys.argv) > 3 and sys.argv[3] == "1":
+    # One line for a sweep table: risk, dark, narrow, median YAVG, median span.
+    print("%d %d %d %d %d" % (100 * both // n, 100 * dark // n,
+                              100 * narrow // n, pct(yavg, 0.5), pct(span, 0.5)))
+    raise SystemExit
 print("  samples            %d" % n)
 print("  YAVG   min/med/max %.0f / %.0f / %.0f" % (min(yavg), pct(yavg, 0.5), max(yavg)))
 print("  span   min/med/max %.0f / %.0f / %.0f   (YHIGH-YLOW, of 255)" % (
@@ -1898,8 +1928,46 @@ print("  darkest samples:")
 for r in rows[:5]:
     print("    %8.1fs  YAVG %5.1f  YLOW %3.0f  YHIGH %3.0f  span %3.0f"
           % (r[0], r[3], r[2], r[4], r[4] - r[2]))
-' "$tmp" "$depth"
+' "$tmp" "$depth" "$quiet"
   rm -f "$tmp"
+}
+
+# One file, printed in full.
+luma_profile() {
+  say "mkvshrink $VERSION build $BUILD"
+  luma_measure "$1" 0
+}
+
+# A folder, printed as a table sorted by risk. The point of a sweep is triage:
+# a film with nothing dark and narrow in it has nothing to band, so it needs no
+# visual check. A high score is not a verdict, only a reason to look.
+luma_sweep() {
+  say "mkvshrink $VERSION build $BUILD"
+  collect_inputs "$@"
+  [[ ${#FILES[@]} -gt 0 ]] || die "no MKV files found"
+  say "Profiling ${#FILES[@]} file(s) at $LUMA_SAMPLES samples each"
+  local out; out="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.sweep.XXXXXX")"
+  local f line i=0
+  for f in "${FILES[@]}"; do
+    i=$((i + 1))
+    printf '\r\033[K  %d/%d %s' "$i" "${#FILES[@]}" "$(basename "$f")" >&2
+    line="$(luma_measure "$f" 1 2>/dev/null || true)"
+    [[ -n "$line" ]] || continue
+    printf '%s\t%s\n' "$line" "$f" >> "$out"
+  done
+  printf '\r\033[K' >&2
+  printf '%6s %6s %6s %6s %6s  %s\n' risk dark narrow yavg span file
+  sort -rn "$out" | while read -r risk dark narrow yavg span path; do
+    printf '%5d%% %5d%% %5d%% %6d %6d  %s\n' \
+      "$risk" "$dark" "$narrow" "$yavg" "$span" "$(basename "$path")"
+  done
+  echo
+  say "risk is the share of sampled frames that are both dark and narrow.
+      Low is trustworthy: nothing dark and narrow means nothing to band, so
+      those need no visual check. High is only a flag, not a verdict. Measured
+      so far: A Silent Voice 5% clean, Princess Mononoke 25% clean,
+      Blade Runner 2049 44% visibly damaged."
+  rm -f "$out"
 }
 
 # Echoes the start time, in seconds, of the darkest sampled point. Uses
@@ -2020,7 +2088,11 @@ apply_plan() {
 
 # ---------------------------- main ------------------------------------------
 if [[ -n "$LUMAPROF" ]]; then
-  luma_profile "$LUMAPROF"
+  if [[ -d "$LUMAPROF" ]]; then
+    luma_sweep "$LUMAPROF"
+  else
+    luma_profile "$LUMAPROF"
+  fi
   exit 0
 fi
 

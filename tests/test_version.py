@@ -34,24 +34,28 @@ if not ms:
     sys.exit(1)
 subs_version = ms.group(1)
 
-# mkvshrink is versioned on its own. It is a separate pipeline with its own
-# release cadence, and forcing it to share a number would mean bumping it every
-# time the 3D tools changed and vice versa, which makes the number useless for
-# the one job it has. What is checked here is that it HAS a version and a build
-# number and stamps both into its output, since that is the property that
-# matters: being able to tell which script wrote a given file.
+# mkvshrink shares the release line with the other three. It was developed
+# against its own numbering and arrived at 3.26 while this repository was at
+# 3.67, which is exactly the ambiguity a version is supposed to remove. Its own
+# PROJECTSTATUS.md says VERSION is the repository release, and BUILD already
+# answers the finer question of which script wrote a given file, so there is no
+# reason for a second numbering scheme.
 shrink = (ROOT / "mkvshrink").read_text()
-for field in ("VERSION", "BUILD"):
-    if not re.search(r'^%s="[^"]+"' % field, shrink, re.M):
-        print("FAIL no %s= line in mkvshrink" % field)
-        sys.exit(1)
-sv = re.search(r'^VERSION="([^"]+)"', shrink, re.M).group(1)
-sb = re.search(r'^BUILD="([^"]+)"', shrink, re.M).group(1)
+ms2 = re.search(r'^VERSION="([^"]+)"', shrink, re.M)
+mb = re.search(r'^BUILD="([^"]+)"', shrink, re.M)
+if not ms2 or not mb:
+    print("FAIL mkvshrink needs both a VERSION and a BUILD line")
+    sys.exit(1)
+shrink_version, shrink_build = ms2.group(1), mb.group(1)
 if "MKVSHRINK_VERSION" not in shrink:
     print("FAIL mkvshrink does not stamp MKVSHRINK_VERSION into its output")
     sys.exit(1)
 
 changelog = (ROOT / "CHANGELOG.md").read_text()
+# An "## Unreleased" heading is allowed to sit above the newest version, so
+# work can accumulate between releases without the scripts claiming a number
+# that nothing has been built under. The rule that matters is unchanged: every
+# archive handed over carries a version, and that version names a real section.
 h = re.search(r'^## +([0-9]+\.[0-9]+)', changelog, re.M)
 if not h:
     print("FAIL no '## X.Y' heading in CHANGELOG.md")
@@ -61,13 +65,16 @@ newest = h.group(1)
 print("mvc2sbs VERSION   %s" % version)
 print("mkvdiff VERSION   %s" % diff_version)
 print("subs3d VERSION    %s" % subs_version)
-print("mkvshrink         %s build %s  (versioned separately)" % (sv, sb))
+print("mkvshrink VERSION %s build %s" % (shrink_version, shrink_build))
 print("CHANGELOG newest  %s" % newest)
+if re.search(r"^## +Unreleased", changelog, re.M):
+    print("CHANGELOG also has an Unreleased section, which is fine between ships")
 
-if version != newest or diff_version != newest or subs_version != newest:
+if newest not in (version, diff_version, subs_version, shrink_version) or \
+        len({version, diff_version, subs_version, shrink_version}) != 1:
     print()
-    print("FAIL these must match. Bump VERSION in mvc2sbs, mkvdiff and subs3d,")
-    print("     add a")
+    print("FAIL these must match. Bump VERSION in mvc2sbs, mkvdiff, subs3d and")
+    print("     mkvshrink, and add a")
     print("     heading to CHANGELOG.md, or a released file cannot be traced to")
     print("     the build that made it.")
     sys.exit(1)
