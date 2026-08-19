@@ -207,10 +207,13 @@ take on trust.
 | `docs/` | mkvshrink's own README and its status report. |
 | `install-mac3d.sh` | Installs the Homebrew dependencies and builds the decoder. |
 | `app/Sources/*.swift` | The Mac app, five files. |
-| `app/build-app.sh` | Builds the app with `swiftc`. No Xcode project. |
-| `app/make-icon.py` | Generates the icon. Needs Pillow, only if you change it. |
+| `app/build-app.sh` | Builds MVC2SBS.app with `swiftc`. No Xcode project. |
+| `app/shrink/Sources/*.swift` | The MKVShrink app. |
+| `app/build-shrink.sh` | Builds MKVShrink.app the same way. |
+| `app/make-icon.py` | Generates both icons. Needs Pillow, only if you change them. |
 | `app/MVC2SBS.icns` | The generated icon, committed so builds do not need Pillow. |
-| `tests/` | The test suite. Eleven files, each written after a real fault. |
+| `app/MKVShrink.icns` | The same, for the shrink app. |
+| `tests/` | The test suite. Twelve files, each written after a real fault. |
 
 The scripts have no file extension because they are meant to be run as commands.
 `file mvc2sbs` will confirm they are plain text.
@@ -239,6 +242,12 @@ project paid for: mux with MKVToolNix and never FFmpeg, never let FFmpeg write
 chapters, preserve StereoMode and display dimensions, check the output before
 touching the original, and stamp provenance into the file. Some of the files it
 will be pointed at are the side-by-side conversions `mvc2sbs` produced.
+
+It has a GUI of its own, `MKVShrink.app`, built by `app/build-shrink.sh`. A
+separate bundle from MVC2SBS deliberately: that app converts one file at a time
+and never touches an original, this one sweeps a library and can move or replace
+files, and the two should not share a Start button. The window is built around
+the plan: scan a folder, read the table, tick what you agree with, then start.
 
 Two documents rather than a section here, because it has enough of its own:
 
@@ -330,11 +339,26 @@ pgs3d.py in.sup out.sup --width 3840 --brightness 0.7 --colour yellow
 
 ### Pale subtitles
 
-On a 1080p display the player squeezes the whole 3840 wide frame, subtitle plane
-included, down to 1920 before the TV stretches each half back out. Measured on
-simulated subtitle text, that 2:1 squeeze and stretch drops the mean luminance
-of lit pixels from 229 to 187, an 18% loss, with the peak unchanged. The result
-reads as pale and soft.
+Subtitles look paler in 3D than they do in 2D, and this file used to blame a
+2:1 squeeze and stretch of the whole frame. That explanation was tested and it
+is wrong, at least on the setup everything here is measured against. See
+[Is anything halving your frame?](#is-anything-halving-your-frame) for how to
+check your own.
+
+The cause is much duller: **3D is simply dimmer**. Active shutter glasses show
+each eye the panel half the time, through a shutter that is not fully
+transparent even when open, so everything loses brightness and subtitles are no
+exception. That is the display mode, not the file.
+
+**Try the television first.** A Panasonic VT60 turned out to keep a separate set
+of picture settings for 3D content, including its own brightness, on the basis
+that 3D is a different internal path. Raising brightness there fixes the actual
+cause and every part of the picture benefits. `--sub-brightness` can only make
+the subtitles brighter than the film around them, which is a workaround for a
+dim display rather than a fix.
+
+Use `--sub-brightness` when the display has nothing left to give, or when you
+want subtitles to sit above the picture deliberately.
 
 `--sub-brightness` applies a gamma to the palette luminance to counteract it.
 Below 1 lifts the anti-aliased midtones and leaves black and peak white where
@@ -347,8 +371,8 @@ they were:
 | 0.70 | 16, 87, 137, 179, 210, 235 |
 
 An earlier version of this file claimed each eye only ever gets 960 pixels of
-horizontal detail on a 1080p 3D TV. That is wrong, and it came from misusing the
-word "frame-compatible".
+horizontal detail on a 1080p 3D TV. That is wrong, and measurably so. It also
+misused the word "frame-compatible".
 
 **Frame-compatible** means both views squeezed into one frame of an existing
 standard size, so they travel through equipment that knows nothing about 3D.
@@ -366,6 +390,46 @@ That full resolution is the whole point of this layout, and it is also why
 support is patchy: 3840x1080 is not a resolution hardware decoders were designed
 around, so some players direct play it and others transcode. Measured so far:
 Kodi and Jellyfin direct play it, Plex does not.
+
+### Is anything halving your frame?
+
+Do not infer this from the TV switching itself into 3D. A TV auto-detects
+side-by-side content whether it arrives full width or half width, so the switch
+tells you nothing about resolution. Direct Play does not answer it either: that
+describes the file reaching the decoder untouched, and says nothing about what
+the player's HDMI output stage did afterwards.
+
+Measure it. Build a Full-SBS file containing vertical lines at 1, 2, 3 and 4
+pixel pitch, identical in both eyes, and the same pattern rotated to horizontal
+as a control. Vertical detail cannot be affected by side-by-side handling, so it
+is the reference the horizontal blocks are judged against.
+
+- **2px horizontal as strong as 2px vertical**: nothing is halving the frame.
+  A halved chain damages the 2px block roughly as much as the 1px block, which
+  is what makes this readable at a glance rather than needing instruments.
+- **1px failing in both directions equally**: that is the panel or its
+  processing, not the 3D path. A 1 pixel alternation sits at the display's
+  Nyquist limit, and plasmas in particular dither heavily and may never resolve
+  it. Cameras cannot resolve it either, so judge this one by eye.
+
+Include a circle. It is the only shape whose distortion cannot be argued with,
+and it catches aspect and cropping faults that a line pattern does not.
+
+**Check overscan before concluding anything.** A Panasonic VT60 keeps a
+*separate* set of picture settings for 3D content, overscan among them,
+independent of the settings for everything else. With 3D overscan on, the
+picture was both cropped and stripped of fine horizontal detail, and nothing in
+the player or the file gave any sign of it. Turning it off restored both.
+
+That separate tree is worth knowing about for its own sake: it also carries its
+own brightness, which is the right place to deal with 3D looking dim.
+
+**One caveat on test files.** Kodi reads the 3D layout from the filename as well
+as from the container, looking for tokens like `sbs` and `tab`. A test file
+named without one may be rendered at the wrong geometry, and the mode it guesses
+can persist into the next file you play. Name test files the way the tool names
+its output, `something.3D-fsbs.mkv`, and if a file looks wrong in Kodi while
+real films look right, suspect that before suspecting the file.
 
 ### Adding subtitles to a film that has none
 
@@ -964,7 +1028,7 @@ python3 tests/test_pgs3d.py    # builds a synthetic PGS stream and verifies it
 shellcheck -S warning mvc2sbs mkvdiff mkvshrink install-mac3d.sh app/build-app.sh
 cd app && ./build-app.sh       # builds the app, fetching the decoder if needed
 python3 -m pip install pillow  # only needed to regenerate the icon
-python3 app/make-icon.py       # regenerates MVC2SBS.icns
+python3 app/make-icon.py       # regenerates MVC2SBS.icns and MKVShrink.icns
 ```
 
 CI runs the shell and Python checks, the PGS test, and a full macOS app build on

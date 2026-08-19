@@ -4,6 +4,7 @@ app/build/
 
 # Generated at build time from make-icon.py
 app/icon-preview.png
+app/shrink-icon-preview.png
 
 # Working files from conversions
 *.264

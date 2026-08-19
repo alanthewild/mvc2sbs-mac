@@ -161,14 +161,28 @@ The console display is a consumer of the same data, so neither owns it.
 
 ## Plan format
 
-Tab-separated. Columns: action, audio, subs, save%, psnr, size_mb, pred_mb,
-uid, path, reason.
+Tab-separated. Columns: action, audio, subs, save%, psnr, ssim, risk, size_mb,
+pred_mb, uid, path, reason.
+
+Plans written before the ssim and risk columns existed have ten columns and
+still apply: the shape decides how a row is read, not the build that wrote it.
+
+`risk` is the banding score `--luma` computes, as a percentage: the share of
+sampled frames that are both dark and low in contrast. It is the one number
+here that has matched what the eye saw. Measured at `--risk-samples` frames per
+file while planning, and only for files something would be done to.
+`--no-risk` turns it off.
 
 Edit the action, audio and subs columns; delete rows to exclude them. Rows are
-matched to files by segment UID as well as path, so a plan that has gone stale
-is refused rather than applied to the wrong tracks. Applying a plan written by
-a different build warns, because the rules and the arithmetic have both changed
+matched to files by segment UID and by size as well as by path, so a plan that
+has gone stale is refused rather than applied to the wrong tracks.
+`--allow-changed` overrides the size check. Applying a plan written by a
+different build warns, because the rules and the arithmetic have both changed
 between builds.
 
 Sort by saving to find where the disk is. Sort by reason to find what was
-skipped and why.
+skipped and why. Sort by risk to find what is worth watching afterwards.
+
+`--tracks FILE` prints the same track table tab separated, one line per track,
+with the keep decision the current rules would make. That is what the GUI reads
+to offer a track back that the rules dropped.

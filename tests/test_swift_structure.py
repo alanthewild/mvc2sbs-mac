@@ -22,7 +22,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC_DIR = ROOT / "app/Sources"
+# Both apps. MKVShrink compiles its own sources plus Tools.swift from the
+# other, so the same lint has to cover both trees.
+SRC_DIRS = [ROOT / "app/Sources", ROOT / "app/shrink/Sources"]
 
 failures = []
 
@@ -89,7 +91,9 @@ def split_args(text):
     return text
 
 
-for path in sorted(SRC_DIR.glob("*.swift")):
+ALL_SOURCES = [p for d in SRC_DIRS for p in sorted(d.glob("*.swift"))]
+
+for path in ALL_SOURCES:
     src = path.read_text()
     code = strip_literals(src)
     name = path.name
@@ -123,11 +127,14 @@ for path in sorted(SRC_DIR.glob("*.swift")):
                 i += 1
         i += 1
 
-    # A switch over the encoder must handle every case or carry a default.
-    for blk in re.findall(r"switch\s+\S*encoder\s*\{(.*?)\n        \}", src, re.S):
-        cases = set(re.findall(r"case \.(\w+)", blk))
-        if "default" not in blk and cases != {"x264", "x265", "videotoolbox"}:
-            failures.append("%s: switch on encoder covers only %s" % (name, sorted(cases)))
+    # A switch over the 3D app's encoder must handle every case or carry a
+    # default. Scoped to that app: MKVShrink has its own two-case encoder and
+    # would fail this rule for being correct.
+    if path.parent.name == "Sources" and path.parent.parent.name == "app":
+        for blk in re.findall(r"switch\s+\S*encoder\s*\{(.*?)\n        \}", src, re.S):
+            cases = set(re.findall(r"case \.(\w+)", blk))
+            if "default" not in blk and cases != {"x264", "x265", "videotoolbox"}:
+                failures.append("%s: switch on encoder covers only %s" % (name, sorted(cases)))
 
     # Computed properties are scoped to their own view. These names are never
     # argument labels, so a match outside the declaring struct is a real error.
@@ -182,7 +189,29 @@ for path in sorted(SRC_DIR.glob("*.swift")):
             failures.append("%s: %d cursor push against %d pop" % (name, pushes, pops))
 
 
-print("checked %d Swift files" % len(list(SRC_DIR.glob("*.swift"))))
+# Tools.swift compiles into BOTH apps, so it may not use a type that only one
+# of them declares. It had `Probe` in it, which reads SourceInfo and TrackInfo
+# from the 3D app's Model.swift, and the MKVShrink build failed with four
+# cannot-find-type errors the first time it was compiled.
+SHARED = ROOT / "app/Sources/Tools.swift"
+shared_src = strip_literals(SHARED.read_text())
+declared_elsewhere = set()
+for path in SRC_DIRS[0].glob("*.swift"):
+    if path == SHARED:
+        continue
+    for m in re.finditer(r"^(?:final )?(?:struct|class|enum|protocol) (\w+)",
+                         path.read_text(), re.M):
+        declared_elsewhere.add(m.group(1))
+
+for name_ in sorted(declared_elsewhere):
+    if re.search(r"\b%s\b" % name_, shared_src):
+        failures.append(
+            "Tools.swift refers to %s, which only the 3D app declares.\n"
+            "     It is compiled into MKVShrink too, so that build would fail."
+            % name_)
+
+print("checked %d Swift files across %d apps" % (len(ALL_SOURCES), len(SRC_DIRS)))
+print("shared file checked against %d types declared elsewhere" % len(declared_elsewhere))
 if failures:
     print()
     for f in failures:

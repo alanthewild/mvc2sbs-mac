@@ -21,13 +21,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-VERSION="3.68"
+VERSION="3.71"
 # Increments on every build handed over, including ones that never reach a
 # release. VERSION alone answers "which release", and during a week of
 # iteration that is eight different scripts all claiming 3.26. BUILD is what
 # tells you which of them wrote a given file, and it is stamped into the
 # output for exactly that reason.
-BUILD="24"
+BUILD="25"
 
 # ------------------------------- defaults ----------------------------------
 ENCODER=vt            # vt | x265
@@ -60,6 +60,10 @@ CALIBRATE_ROWS=""
 KEEPCLIPS=0
 LUMAPROF=""
 LUMA_SAMPLES=120
+RISKSCORE=1           # measure banding risk while planning
+ALLOWCHANGED=0        # apply a plan row even if the file is not the size it was
+RISKSAMPLES=24        # samples per file for the plan's risk column
+TRACKSOF=""
 DARKEST=1
 INTERACTIVE=0
 ATRACKS=""
@@ -175,8 +179,17 @@ Options
                         (default: a _replaced folder beside each file)
 
   Other
+      --tracks FILE     print one tab separated line per track and exit, with
+                        the keep decision the current rules would make
+      --no-risk         do not measure banding risk while planning
+      --allow-changed   apply a plan row even if the file is no longer the size
+                        the plan recorded. Off by default: a file that changed
+                        under a plan is a different file
+      --risk-samples N  frames sampled for the risk column (default $RISKSAMPLES)
       --no-recurse      do not descend into subfolders
-      --temp DIR        scratch directory (default: beside the output)
+      --temp DIR        scratch directory (default: beside the output. Probe
+                        clips never go there: they use TMPDIR, so planning
+                        does not write into the folder it is only reading)
       --verify-quality  measure PSNR over the whole file after encoding, not
                         just the probe. Roughly doubles the time.
       --machine         emit machine-readable @@ lines on stdout
@@ -250,6 +263,7 @@ while [[ $# -gt 0 ]]; do
                        esac
                        shift 2 ;;
     --apply)           APPLYIN="$2"; shift 2 ;;
+    --tracks)          TRACKSOF="$2"; shift 2 ;;
     --calibrate)       CALIBRATE="$2"; shift 2 ;;
     --calibrate-at)    CALIBRATE_AT="$2"; shift 2 ;;
     --calibrate-len)   CALIBRATE_LEN="$2"; shift 2 ;;
@@ -257,6 +271,9 @@ while [[ $# -gt 0 ]]; do
     --keep-clips)      KEEPCLIPS=1; shift ;;
     --luma)            LUMAPROF="$2"; shift 2 ;;
     --luma-samples)    LUMA_SAMPLES="$2"; shift 2 ;;
+    --no-risk)         RISKSCORE=0; shift ;;
+    --allow-changed)   ALLOWCHANGED=1; shift ;;
+    --risk-samples)    RISKSAMPLES="$2"; shift 2 ;;
     --no-darkest)      DARKEST=0; shift ;;
     --x265)            ENCODER=x265; shift ;;
     --vt-quality)      VTQUALITY="$2"; shift 2 ;;
@@ -331,6 +348,10 @@ aud_langs = [x.strip().lower() for x in sys.argv[5].split(",") if x.strip()]
 keep_comm = sys.argv[6] == "1"
 keep_forced = sys.argv[7] == "1"
 keep_all = sys.argv[8] == "1"
+# Optional: the same track table again, tab separated, for anything that has
+# to read it rather than look at it. The human table is aligned with spaces
+# and track names contain spaces, so it cannot be parsed back.
+tsv_path = sys.argv[9] if len(sys.argv) > 9 else ""
 
 out = {}
 
@@ -620,6 +641,26 @@ for r in [video] + audio + subs:
         ",".join(flags)[:12], fmt_size(r["bytes"]), keep, nm))
 open(table_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
 
+if tsv_path:
+    rows = ["#id\ttype\tlang\tcodec\tchannels\tflags\tbytes\tkeep\twhy\tname"]
+    for r in [video] + audio + subs:
+        flags = []
+        if r["default"]:
+            flags.append("default")
+        if r["forced"]:
+            flags.append("forced")
+        if r["type"] != "video" and is_commentary(r):
+            flags.append("commentary")
+        if r["type"] == "subtitles" and is_sdh(r):
+            flags.append("sdh")
+        keep = 1 if (r["type"] == "video" or r.get("why")) else 0
+        rows.append("\t".join(str(x) for x in [
+            r["id"], r["type"], r["lang"], r["codec"].replace("\t", " "),
+            r["channels"], ",".join(flags), r["bytes"], keep,
+            r.get("why", "") if r["type"] != "video" else "video",
+            r["name"].replace("\t", " ")]))
+    open(tsv_path, "w", encoding="utf-8").write("\n".join(rows) + "\n")
+
 emit()
 PROBEPY
 
@@ -629,12 +670,14 @@ probe_file() {
   mkjson="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.mk.XXXXXX")"
   ffjson="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.ff.XXXXXX")"
   P_TABLE="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.tbl.XXXXXX")"
+  P_TSV="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.tsv.XXXXXX")"
   mkvmerge -J "$f" > "$mkjson" 2>/dev/null || echo '{}' > "$mkjson"
   ffprobe -v error -show_streams -show_format -of json "$f" > "$ffjson" 2>/dev/null \
     || echo '{}' > "$ffjson"
   local kv
   kv="$(python3 -c "$PROBE_PY" "$mkjson" "$ffjson" "$P_TABLE" \
-        "$SUBLANGS" "$AUDIOLANGS" "$KEEPCOMMENTARY" "$KEEPFORCED" "$NOTRACKS")"
+        "$SUBLANGS" "$AUDIOLANGS" "$KEEPCOMMENTARY" "$KEEPFORCED" "$NOTRACKS" \
+        "$P_TSV")"
   rm -f "$mkjson" "$ffjson"
   OK=0; ERR=""; WARNINGS=""
   eval "$kv"
@@ -829,6 +872,18 @@ default_flag_args() {
     if [[ "$id" == "$chosen" ]]; then echo "${id}:1"; else echo "${id}:0"; fi
   done
 }
+
+# Scratch for probe clips. Not the folder the film is in, even though that is
+# where the real encode has to work: creating and deleting a file in a
+# directory updates that directory's modification time, so planning a library
+# it is only reading from restamped every folder in it to today. A plan changes
+# nothing on disk and should leave no trace of having run.
+probe_scratch() {
+  local d="${TMPDIR:-/tmp}/mkvshrink-probe.$$"
+  mkdir -p "$d" 2>/dev/null || d="${TMPDIR:-/tmp}"
+  echo "$d"
+}
+trap 'rm -rf "${TMPDIR:-/tmp}/mkvshrink-probe.$$"' EXIT
 
 # probe_encode SRC WORKDIR -> sets PE_RATIO PE_PSNR PE_SSIM
 probe_encode() {
@@ -1558,9 +1613,16 @@ plan_row() {  # emits one TSV row for the current probe state
   # containing anything odd cannot shift it. A skip row without a reason is
   # useless: "too small to bother with" and "re-encoding would make it bigger"
   # sort identically at 0.0% and want completely different responses.
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  # SSIM sits beside PSNR. The probe has measured it all along and threw it
+  # away at this line, which made it impossible to sort a plan by it.
+  # Risk is the banding score --luma already computes: the share of sampled
+  # frames that are both dark and low contrast. It is the one number that has
+  # actually predicted a bad result on real films, and PSNR does not see it.
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$D_ACTION" "${PLAN_AUDIO}" "${PLAN_SUBS}" "${PLAN_SAVE}" \
-    "${PE_PSNR:--}" "${PLAN_SIZE}" "${PLAN_PRED}" "${SEGUID:-}" "$1" "$(plan_reason)"
+    "${PE_PSNR:--}" "${PE_SSIM:--}" "${PLAN_RISK:--}" \
+    "${PLAN_SIZE}" "${PLAN_PRED}" \
+    "${SEGUID:-}" "$1" "$(plan_reason)"
 }
 
 # analyse FILE -> fills D_ACTION, PLAN_*
@@ -1599,14 +1661,31 @@ analyse() {
   PLAN_SIZE="$(python3 -c 'import sys;print("%.0f"%(int(sys.argv[1])/1048576))' "${TOTAL_BYTES:-0}")"
   PLAN_PRED="$PLAN_SIZE"; PLAN_SAVE="0.0"
 
+  # Banding risk, for the plan. PSNR is an average over a whole window and a
+  # film bands in the two dark scenes it has, so a file can score 43 dB and
+  # still look wrong: Blade Runner 2049 measured fine and was visibly damaged.
+  # This is the only column that has caught that. Measured at fewer samples
+  # than --luma uses, because a sweep pays for it once per file, and only for
+  # files something is going to be done to.
+  PLAN_RISK="-"
+  if [[ $RISKSCORE -eq 1 && "$D_ACTION" != "skip" ]] \
+     && python3 -c 'import sys; sys.exit(0 if float(sys.argv[1] or 0) > 60 else 1)' \
+        "${DURATION:-0}" 2>/dev/null; then
+    local rl
+    rl="$(luma_stats "$f" "$RISKSAMPLES" 1 2>/dev/null || true)"
+    case "${rl%% *}" in
+      ''|*[!0-9]*) PLAN_RISK="-" ;;
+      *)           PLAN_RISK="${rl%% *}" ;;
+    esac
+  fi
+
   if [[ "$D_ACTION" == "skip" ]]; then
     say "$(basename "$f"): skipped, $D_REASON"
     return 0
   fi
 
   if [[ "$D_ACTION" == "shrink" ]]; then
-    local work="${TMPROOT:-$(dirname "$f")}"
-    mkdir -p "$work"
+    local work; work="$(probe_scratch)"
     if probe_encode "$f" "$work" && [[ -n "${PE_RATIO:-}" ]]; then
       read -r PLAN_PRED PLAN_SAVE <<<"$(python3 -c '
 import sys
@@ -1725,7 +1804,7 @@ do_calibrate() {
   [[ -f "$f" ]] || die "no such file: $f"
   probe_file "$f"
   [[ "$P_OK" == "1" ]] || die "${P_ERR:-could not read $f}"
-  local work="${TMPROOT:-$(dirname "$f")}"
+  local work="${TMPROOT:-$(probe_scratch)}"
   mkdir -p "$work"
   local at="$CALIBRATE_AT"
   if [[ -z "$at" ]]; then
@@ -1856,7 +1935,15 @@ luma_measure() {
   local dur="${DURATION:-0}"
   python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 60 else 1)' "$dur" \
     || die "too short to profile"
-  local n="${LUMA_SAMPLES}"
+  luma_stats "$f" "$LUMA_SAMPLES" "$quiet"
+}
+
+# The sampling itself, split out so the planner can ask for a risk score
+# without re-probing a file it has already probed and without dying on one it
+# cannot measure. Reads DURATION and IS_10BIT from the caller's probe.
+luma_stats() {
+  local f="$1" n="$2" quiet="${3:-0}"
+  local dur="${DURATION:-0}"
   # signalstats reports in the source bit depth, so a 10-bit file comes back on
   # a 0-1023 scale. Comparing that against thresholds written for 0-255 makes a
   # 10-bit film look four times wider than it is, and every file this tool
@@ -2006,7 +2093,7 @@ write_plan() {
     printf '# audio/subs: comma separated mkvmerge track IDs, or all, or none\n'
     printf '# Sort by save%% to find the rows the rules got wrong: they cluster.\n'
     printf '#\n'
-    printf '#action\taudio\tsubs\tsave%%\tpsnr\tsize_mb\tpred_mb\tuid\tpath\treason\n'
+    printf '#action\taudio\tsubs\tsave%%\tpsnr\tssim\trisk\tsize_mb\tpred_mb\tuid\tpath\treason\n'
   } > "$out"
   local f
   for f in "${FILES[@]}"; do
@@ -2043,11 +2130,26 @@ apply_plan() {
       Re-run --plan if the numbers matter."
   fi
   local n=0 done=0 failed=0 skipped=0
-  local action akeep skeep save psnr size pred uid path reason
-  # save, size, pred and reason are read for their column position only. The file is
-  # re-probed here rather than trusted, because the plan may be old.
+  local action akeep skeep save psnr ssim risk size pred uid path reason
+  local -a f
+  # save, size, pred, psnr, ssim, risk and reason are read for their column
+  # position only. The file is re-probed here rather than trusted, because the
+  # plan may be old.
   # shellcheck disable=SC2034
-  while IFS=$'\t' read -r action akeep skeep save psnr size pred uid path reason; do
+  while IFS=$'\t' read -r -a f; do
+    # Plans written before the ssim and risk columns existed have ten fields,
+    # not twelve. Reading one of those with the new field list would put size
+    # into ssim and shift everything after it, so the shape decides rather than
+    # the build.
+    if [[ ${#f[@]} -ge 12 ]]; then
+      action="${f[0]}"; akeep="${f[1]}"; skeep="${f[2]}"; save="${f[3]}"
+      psnr="${f[4]}"; ssim="${f[5]}"; risk="${f[6]}"; size="${f[7]}"
+      pred="${f[8]}"; uid="${f[9]}"; path="${f[10]}"; reason="${f[11]}"
+    else
+      action="${f[0]:-}"; akeep="${f[1]:-}"; skeep="${f[2]:-}"; save="${f[3]:-}"
+      psnr="${f[4]:-}"; ssim="-"; risk="-"; size="${f[5]:-}"; pred="${f[6]:-}"
+      uid="${f[7]:-}"; path="${f[8]:-}"; reason="${f[9]:-}"
+    fi
     [[ -z "$action" || "$action" == \#* ]] && continue
     n=$((n + 1))
     [[ "$action" == "skip" ]] && { skipped=$((skipped + 1)); continue; }
@@ -2066,6 +2168,21 @@ apply_plan() {
     if [[ -n "$uid" && -n "${SEGUID:-}" && "$uid" != "$SEGUID" ]]; then
       warn "$path has changed since the plan was written, so it is left alone.
       Re-run --plan for it."
+      failed=$((failed + 1)); continue
+    fi
+    # Size, as well as the UID. Not every MKV carries a segment UID, and the
+    # ones that do keep it through an mkvpropedit or a remux that changed the
+    # tracks underneath. A plan that is a week old and a file that is not the
+    # size the plan measured are not something to re-encode on the assumption
+    # it will be fine.
+    local nowmb
+    nowmb="$(python3 -c 'import sys;print("%.0f"%(int(sys.argv[1])/1048576))' \
+             "${TOTAL_BYTES:-0}" 2>/dev/null || echo 0)"
+    if [[ $ALLOWCHANGED -eq 0 && -n "$size" && "$size" != "0" ]] \
+       && [[ $((nowmb > size ? nowmb - size : size - nowmb)) -gt 1 ]]; then
+      warn "$(basename "$path") was ${size} MB when the plan was written and is
+      ${nowmb} MB now, so it is not the file that was measured. Left alone.
+      Re-run --plan for it, or --allow-changed to apply the plan anyway."
       failed=$((failed + 1)); continue
     fi
     [[ "$akeep" == "all" ]] && akeep="${AUDIO_ALL}"
@@ -2093,6 +2210,18 @@ if [[ -n "$LUMAPROF" ]]; then
   else
     luma_profile "$LUMAPROF"
   fi
+  exit 0
+fi
+
+if [[ -n "$TRACKSOF" ]]; then
+  # The track table, machine readable, so a front end can offer "keep this one
+  # after all" against the real IDs rather than against what it guessed. No
+  # probe encode and no side effects: this is a read.
+  [[ -f "$TRACKSOF" ]] || die "no such file: $TRACKSOF"
+  probe_file "$TRACKSOF"
+  [[ "$P_OK" == "1" ]] || die "${P_ERR:-could not read $TRACKSOF}"
+  cat "$P_TSV"
+  rm -f "$P_TABLE" "$P_TSV"
   exit 0
 fi
 

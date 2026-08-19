@@ -17,11 +17,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Shellcheck
-        run: shellcheck -S warning mvc2sbs mkvdiff mkvshrink install-mac3d.sh app/build-app.sh
+        run: shellcheck -S warning mvc2sbs mkvdiff mkvshrink install-mac3d.sh app/build-app.sh app/build-shrink.sh
 
       - name: Bash syntax
         run: |
-          for f in mvc2sbs mkvdiff mkvshrink install-mac3d.sh app/build-app.sh; do
+          for f in mvc2sbs mkvdiff mkvshrink install-mac3d.sh app/build-app.sh app/build-shrink.sh; do
             bash -n "$f"
           done
 
@@ -75,6 +75,9 @@ jobs:
 
       - name: mkvshrink track selection
         run: python3 tests/test_mkvshrink.py
+
+      - name: MKVShrink GUI passes flags mkvshrink accepts
+        run: python3 tests/test_shrink_gui.py
 
   build-app:
     name: Build the macOS app

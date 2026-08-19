@@ -1,5 +1,137 @@
 # Changelog
 
+## 3.71
+
+- **The planning screen explains what a probe encode is** rather than using the
+  phrase and moving on. Metadata cannot predict how much HEVC will win, because
+  that depends on how tightly the source was already encoded, so short sample
+  windows are cut out and encoded for real and the saving is measured. That is
+  why it takes minutes per file, and the screen now says so.
+- **Warnings are counted, not shown, in the status bar.** mkvshrink explains its
+  decisions in paragraphs, and a status bar fits about a third of one, which is
+  worse than fitting none: the Casino Royale PSNR note ran off the end of the
+  window mid-sentence. It now reads "N notes in the Console" and clicking it
+  opens the Console. The planning screen carries the same link while a scan is
+  running. Real errors still show as errors.
+- **Planning no longer writes into the folder it is reading.** Probe clips were
+  cut beside the source, and creating and deleting a file in a directory
+  restamps that directory: a library of films created in 2015 came back
+  modified today, from a run that changed nothing. Probe clips now go to
+  `TMPDIR` and the scratch directory is removed on exit. `--temp` still
+  controls where the real encode works, which has to be able to sit next to the
+  output.
+- **A `risk` column in the plan**, and a sortable one in the GUI. It is the
+  banding score `--luma` has always computed: the share of sampled frames that
+  are both dark and low in contrast. It is the only number here that has
+  matched what the eye saw. Blade Runner 2049 measured 44% and was visibly
+  damaged, Princess Mononoke measured 25% and was clean. PSNR is nearly blind
+  to banding, because the error is small and spread over a large flat area,
+  which is what an average hides. Measured at 24 samples per file while
+  planning, only for files something would be done to. `--no-risk` skips it.
+- An `ssim` column too, beside PSNR. The probe measured it all along and threw
+  it away when writing the row.
+- **`mkvshrink --tracks FILE`** prints the track table tab separated, with the
+  keep decision the current rules would make. The human table is space aligned
+  and track names contain spaces, so it could not be parsed back.
+- **The GUI can edit which tracks survive, per file.** The plan's audio and
+  subs columns are track IDs, which say nothing about what is in them. The
+  Tracks button opens the file's real track list with language, codec, name,
+  flags, size, and what the rules decided and why. This is for the case the
+  tool has always admitted to and could not fix: a Japanese film released with
+  the English dub as track 1, where the original language is neither first nor
+  whitelisted and is silently dropped. The row is flagged orange when that has
+  happened.
+- **Sorting by name, action, saving, size, size after, PSNR, risk or reason.**
+  Previously five of those.
+- **A right click menu on each row**: shrink only this one, edit its tracks,
+  set its action, tick or untick everything from this row down, untick
+  everything above, reveal in Finder. "Down" means down the screen in the
+  current sort order.
+- **A Bulk menu in the toolbar**: set every ticked row to shrink, strip or
+  skip; untick the rows the rules skipped; untick everything under 10% saving.
+- **Load Plan.** A plan costs minutes per file to produce and was write-only.
+  Rows whose files have moved are unticked and marked missing on load.
+- **A file that changed under a plan is refused.** `--apply` already compared
+  the segment UID, but not every MKV carries one and the ones that do keep it
+  through a remux that changed the tracks underneath. It now also compares the
+  size the plan recorded, and leaves anything that does not match alone.
+  `--allow-changed` overrides.
+- **MKVShrink has an icon.** The same two frames as MVC2SBS, but one of them
+  has become small: same background, same corner radius, same frame language,
+  so they read as a set in the Dock without reading as the same app. The small
+  frame is cut out of the large one rather than blended over it, because two
+  translucent overlapping rectangles turn into one grey shape at 16px.
+  `make-icon.py` now generates both, and MVC2SBS.icns comes out byte identical.
+- **The originals policy is on screen at all times**, as a coloured banner
+  under the toolbar: KEEPING ORIGINALS, ORIGINALS MOVE TO _replaced, or
+  ORIGINALS ARE REPLACED IN PLACE. It is the one setting whose wrong value
+  cannot be undone, and a sweep that reclaimed nothing looks exactly like a
+  sweep that replaced twenty-five films until it is over.
+
+
+## 3.70
+
+- **The MKVShrink build failed on the first compile.** `Tools.swift` is shared
+  between the two apps, and it had `Probe` in it, which reads `SourceInfo` and
+  `TrackInfo` from the 3D app's `Model.swift`. Four cannot-find-type errors.
+  `Probe` moves to its own file, so the shared file holds nothing but tool
+  discovery. Nothing changes for MVC2SBS, which compiles the whole directory.
+- test_swift_structure.py now checks the shared file against every type the 3D
+  app declares elsewhere, so it cannot pick up a private dependency again.
+  Verified by reintroducing the fault and watching it fail.
+
+
+## 3.69
+
+- **MKVShrink.app**, a GUI for mkvshrink, built by `app/build-shrink.sh`.
+  A separate bundle from MVC2SBS on purpose: that app converts one file at a
+  time and never touches an original, this one sweeps a library and can move or
+  replace files, and putting a destructive bulk tool next to a safe single-file
+  one is how somebody eventually clicks the wrong Start. `Tools.swift` is
+  compiled into both from one copy, so tool discovery cannot drift.
+- The window is built around the plan, because reviewing a TSV in a spreadsheet
+  is the worst part of using the tool: scan a folder, sort by saving or PSNR or
+  reason, tick what you agree with, change an action per row, start. It never
+  bypasses `--plan` and `--apply`.
+- **It defaults to keeping originals**, which differs from the script's default
+  of the `_replaced` folder, and Settings says so rather than leaving you to
+  find out. In a GUI a click is cheap and a library is not.
+- Settings shows the exact command line it will run. A GUI that hides that is
+  harder to trust and much harder to debug.
+- **`tests/test_shrink_gui.py` checks the interface rather than the app.**
+  Swift cannot be compiled here, but the place a GUI driving a command line tool
+  actually breaks can be: every flag the app passes is checked against
+  mkvshrink's own parser, flags that take a value are checked to have one, and
+  the shipped defaults are compared against the script's. It caught three
+  invented flags while the app was being written: `--vt`, `--10bit` and
+  `--replace-folder` do not exist, because VideoToolbox, 10-bit and the
+  `_replaced` folder are all defaults with nothing to request them.
+
+- **The "pale subtitles because the frame gets squeezed" explanation was wrong**,
+  and is replaced rather than qualified. Measured with a resolution wedge on the
+  setup everything here is tested against: horizontal detail survives exactly as
+  well as vertical, so nothing is halving the frame. The 229 to 187 luminance
+  measurement was of a squeeze that does not happen. The likely cause is active
+  shutter glasses, which cost most of the panel's brightness in 3D and dim
+  everything equally. `--sub-brightness` remains the right control, for a
+  different reason.
+- **A new section on how to check whether anything is halving your frame**,
+  because none of the obvious methods work. The TV switching into 3D proves
+  nothing, since it auto-detects side-by-side at either width. Direct Play
+  proves nothing, since it describes the file reaching the decoder and not what
+  the HDMI output stage did next. Kodi's info overlay reports the same thing.
+  A line-pitch wedge with a vertical control answers it in one look.
+- **A Panasonic VT60 keeps a whole separate set of picture settings for 3D**,
+  overscan among them. With 3D overscan on, the picture was cropped and fine
+  horizontal detail was gone, and nothing in the file or either player gave any
+  sign of it. That tree also carries its own brightness, which is the right
+  place to fix 3D looking dim: raising it helps the whole picture, where
+  `--sub-brightness` can only lift the subtitles above the film around them.
+- Kodi reads the 3D layout from the filename as well as the container, so a test
+  file named without an `sbs` token can render at the wrong geometry, and the
+  guess can persist into the next file played. Noted, because it cost a round of
+  chasing a fault that was not in the file.
+
 ## 3.68
 
 **mkvshrink is merged properly.** It arrived in 3.61 as a script dropped into
