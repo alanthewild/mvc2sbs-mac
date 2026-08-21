@@ -21,13 +21,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-VERSION="3.71"
+VERSION="3.72"
 # Increments on every build handed over, including ones that never reach a
 # release. VERSION alone answers "which release", and during a week of
 # iteration that is eight different scripts all claiming 3.26. BUILD is what
 # tells you which of them wrote a given file, and it is stamped into the
 # output for exactly that reason.
-BUILD="25"
+BUILD="26"
 
 # ------------------------------- defaults ----------------------------------
 ENCODER=vt            # vt | x265
@@ -64,6 +64,8 @@ RISKSCORE=1           # measure banding risk while planning
 ALLOWCHANGED=0        # apply a plan row even if the file is not the size it was
 RISKSAMPLES=24        # samples per file for the plan's risk column
 TRACKSOF=""
+LOGFILE=""
+LOGDIR="${MKVSHRINK_LOG_DIR:-$HOME/Library/Logs/mkvshrink}"
 DARKEST=1
 INTERACTIVE=0
 ATRACKS=""
@@ -76,6 +78,7 @@ VERIFY_FULL=0
 SETPARAMS=""
 SP_PRIM=bt709; SP_TRC=bt709; SP_SPC=bt709; SP_RANGE=tv
 PE_RATIO=""; PE_PSNR=""; PE_SSIM=""; PE_PROBES=0
+PE_BEST=""; PE_WORST=""; PE_SPREAD=""
 PROGRESS_DUR=""; PROGRESS_NAME=""
 STRIP_SAVE="0.0"; ENC_GAIN="0.0"
 
@@ -181,6 +184,9 @@ Options
   Other
       --tracks FILE     print one tab separated line per track and exit, with
                         the keep decision the current rules would make
+      --log FILE        write this run's console output here
+      --log-dir DIR     log directory (default: ~/Library/Logs/mkvshrink, one
+                        file per run). "none" turns logging off
       --no-risk         do not measure banding risk while planning
       --allow-changed   apply a plan row even if the file is no longer the size
                         the plan recorded. Off by default: a file that changed
@@ -248,6 +254,7 @@ print(int(n * mult[m.group(2)]))
 
 # ------------------------------- args --------------------------------------
 INPUTS=()
+ORIG_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --plan)            PLANOUT="$2"
@@ -271,6 +278,8 @@ while [[ $# -gt 0 ]]; do
     --keep-clips)      KEEPCLIPS=1; shift ;;
     --luma)            LUMAPROF="$2"; shift 2 ;;
     --luma-samples)    LUMA_SAMPLES="$2"; shift 2 ;;
+    --log)             LOGFILE="$2"; shift 2 ;;
+    --log-dir)         LOGDIR="$2"; shift 2 ;;
     --no-risk)         RISKSCORE=0; shift ;;
     --allow-changed)   ALLOWCHANGED=1; shift ;;
     --risk-samples)    RISKSAMPLES="$2"; shift 2 ;;
@@ -332,6 +341,50 @@ need ffmpeg; need ffprobe; need mkvmerge; need mkvextract; need mkvpropedit
 need python3
 
 mach "@@version $VERSION"
+
+# ------------------------------- logging -----------------------------------
+# The interesting line is always the one that scrolled away, and a sweep of a
+# library scrolls for hours. Same arrangement as mvc2sbs: everything on stderr
+# is copied to a file, one per run, kept with the other logs rather than in the
+# media folder. A stray .log in a library is clutter, and as of this build a
+# plan does not write anything into those folders at all.
+if [[ "$LOGDIR" == "none" ]]; then
+  LOGFILE=""
+elif [[ -z "$LOGFILE" && $DRYRUN -eq 0 && -z "$TRACKSOF" ]]; then
+  mkdir -p "$LOGDIR" 2>/dev/null &&
+    LOGFILE="${LOGDIR}/mkvshrink-$(date +%Y%m%d-%H%M%S).log"
+fi
+
+# tee copies bytes rather than lines, so the encoder's carriage-return redraw
+# still behaves on the terminal. The colour codes and the redraws are cleaned
+# out of the file at exit, not on the way in.
+finalise_log() {
+  [[ -n "${LOGFILE:-}" && -f "${LOGFILE:-}" ]] || return 0
+  sleep 0.2
+  python3 - "$LOGFILE" <<'PYEOF' 2>/dev/null || true
+import re, sys
+p = sys.argv[1]
+d = open(p, "rb").read().decode("utf-8", "replace")
+d = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", d)
+d = "\n".join(l.split("\r")[-1] for l in d.split("\n"))
+open(p, "w", encoding="utf-8").write(d)
+PYEOF
+}
+
+if [[ -n "$LOGFILE" ]]; then
+  if : >> "$LOGFILE" 2>/dev/null; then
+    {
+      printf 'mkvshrink %s build %s\n' "$VERSION" "$BUILD"
+      printf 'started %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+      printf 'command '
+      printf '%q ' "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+      printf '\n\n'
+    } >> "$LOGFILE"
+    exec 2> >(tee -a "$LOGFILE" >&2)
+  else
+    LOGFILE=""
+  fi
+fi
 
 # ---------------------------- probe helper ---------------------------------
 # One Python pass over mkvmerge -J and ffprobe -show_streams, because the two
@@ -583,6 +636,14 @@ out["IS_HEVC"] = 1 if "HEVC" in video["codec_id"].upper() or "265" in video[
 out["IS_HDR"] = 1 if video["trc"] in ("smpte2084", "arib-std-b67") else 0
 out["IS_INTERLACED"] = 0 if video["field"] in ("", "progressive", "unknown") else 1
 out["IS_10BIT"] = 1 if "10" in video["pix"] else 0
+# 10-bit H.264, which anime releases use constantly and no consumer hardware
+# decoder will touch. Measured on the Shield this project is tested against:
+# refused outright, "the video codec's profile is not supported", and
+# transcoded. HEVC Main 10 plays. That makes converting one of these worth
+# doing at any saving, including none, which is the opposite of every other
+# rule here, so it is detected rather than left to be noticed.
+out["IS_HI10P"] = 1 if (out["IS_10BIT"] and not out["IS_HEVC"] and (
+    "AVC" in video["codec_id"].upper() or "264" in video["codec_id"])) else 0
 
 out["AUDIO_ALL"] = ",".join(str(r["id"]) for r in audio)
 out["SUBS_ALL"] = ",".join(str(r["id"]) for r in subs)
@@ -821,8 +882,15 @@ if dur <= 0:
 # still, so sample the body of it.
 if dur < ln * 6:
     pts = [max(0.0, dur / 2 - ln / 2)]
-else:
+elif n <= 3:
     pts = [dur * f for f in (0.20, 0.45, 0.70)][:n]
+else:
+    # More than three was accepted and then ignored: the list held three
+    # fractions and n only sliced it, so --probes 6 measured three windows
+    # and reported a more confident number for the same evidence. Spread
+    # them instead. Three keeps its historical placement so every figure
+    # recorded in the docs stays reproducible.
+    pts = [dur * (0.15 + 0.65 * i / (n - 1)) for i in range(n)]
 for p in pts:
     print("%.3f %d" % (p, min(ln, max(1, int(dur - p)))))
 ' "$1" "$PROBECOUNT" "$PROBELEN"
@@ -883,7 +951,7 @@ probe_scratch() {
   mkdir -p "$d" 2>/dev/null || d="${TMPDIR:-/tmp}"
   echo "$d"
 }
-trap 'rm -rf "${TMPDIR:-/tmp}/mkvshrink-probe.$$"' EXIT
+trap 'rm -rf "${TMPDIR:-/tmp}/mkvshrink-probe.$$"; finalise_log' EXIT
 
 # probe_encode SRC WORKDIR -> sets PE_RATIO PE_PSNR PE_SSIM
 probe_encode() {
@@ -895,7 +963,7 @@ probe_encode() {
   # encode_video below sees the override.
   local DRYRUN=0
   local psrc penc start len n=0 sa=0 sb=0
-  local psnrs="" ssims=""
+  local psnrs="" ssims="" ratios=""
   psrc="$work/probe.src.mkv"
   penc="$work/probe.enc.mkv"
 
@@ -958,6 +1026,9 @@ sys.exit(0 if g > 0 and e >= g * 0.95 else 1)' "$encdur" "$got" 2>/dev/null; the
       continue
     fi
     sa=$((sa + a)); sb=$((sb + b)); n=$((n + 1))
+    # Keep each window's own ratio as well as the total. The total is what the
+    # prediction is made from, and it cannot show that the windows disagreed.
+    ratios="$ratios $(python3 -c 'import sys;print("%.4f"%(int(sys.argv[2])/int(sys.argv[1])))' "$a" "$b")"
     # The source is the reference here. Unlike ranking two encoders against
     # each other, a shrink has exactly one thing it must not drift from, and
     # this measures that drift directly.
@@ -998,6 +1069,15 @@ print("%.4f"%min(v) if v else "")' "$psnrs")"
 import sys
 v=[float(x) for x in sys.argv[1].split()]
 print("%.4f"%min(v) if v else "")' "$ssims")"
+  # How far apart the windows were, as a multiple. Two windows of the same
+  # film should land within a factor of two of each other; five means one of
+  # them was a black frame or a still.
+  read -r PE_BEST PE_WORST PE_SPREAD <<<"$(python3 -c '
+import sys
+v = [float(x) for x in sys.argv[1].split() if float(x) > 0]
+if len(v) < 2:
+    print("- - "); raise SystemExit
+print("%.4f %.4f %.1f" % (min(v), max(v), max(v) / min(v)))' "$ratios")"
   PE_PROBES="$n"
   return 0
 }
@@ -1330,6 +1410,10 @@ land_output() {
     echo "$o"; return 0
   fi
   local landed="${dst}/${base}.mkvshrink.landing.mkv"
+  # Minutes for a large file, and it used to happen in silence. Said on stderr
+  # rather than through say(), because this function's stdout is the path it
+  # returns and anything else written there becomes part of it.
+  printf '\033[1;36m==>\033[0m Copying the result to %s\n' "$dst" >&2
   cp "$o" "$landed" || { rm -f "$landed"; return 1; }
   # A short copy is a valid MKV of the wrong length, and every check that
   # mattered ran against the file on the scratch disk, not this one.
@@ -1340,6 +1424,37 @@ land_output() {
   fi
   rm -f "$o"
   echo "$landed"
+}
+
+# Reads mkvmerge --gui-mode on stdin and redraws one progress line, the same
+# shape as the encoder's. Everything that is not a progress line goes to the
+# log, to be shown only if the mux has something to say.
+#
+# --gui-mode rather than parsing the ordinary output: without it the progress
+# is carriage-return separated inside a single line, which is fine on a
+# terminal and unparseable through a pipe. With it each step is its own line.
+mux_filter() {
+  local log="$1" name="$2" t0="$3"
+  local line p el bar filled last=-1
+  while IFS= read -r line; do
+    case "$line" in
+      '#GUI#progress '*)
+        p="${line#\#GUI\#progress }"; p="${p%\%}"
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        [[ "$p" == "$last" ]] && continue
+        last="$p"
+        el=$(( $(date +%s) - t0 ))
+        [[ $MACHINE -eq 1 ]] && \
+          printf '@@progress file=%s pct=%s.0 elapsed=%d\n' "$name" "$p" "$el"
+        filled=$(( 24 * p / 100 ))
+        bar="$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' $((24 - filled)) '' | tr ' ' '.')"
+        printf '\r\033[K  [%s] %3s%%  muxing  %dm%02ds' "$bar" "$p" $((el / 60)) $((el % 60)) >&2
+        ;;
+      '#GUI#'*) ;;
+      *) printf '%s\n' "$line" >> "$log" ;;
+    esac
+  done
+  printf '\r\033[K' >&2
 }
 
 shrink_one() {
@@ -1419,7 +1534,7 @@ shrink_one() {
   # Audio and subtitles come straight from the source here rather than through
   # the encode, so they are never touched by FFmpeg at all and keep their
   # languages, names and flags without anything having to restore them.
-  local -a mkv=(mkvmerge -q -o "$out")
+  local -a mkv=(mkvmerge --gui-mode -o "$out")
   local vsrc="$src"
   if [[ "$action" == "shrink" ]]; then
     mkv+=(--no-chapters --no-global-tags --no-track-tags)
@@ -1459,10 +1574,35 @@ shrink_one() {
     cleanup_one; return 0
   fi
 
-  if ! "${mkv[@]}"; then
+  # The step that used to go silent for minutes. On a 60 GB source the mux
+  # reads every audio and subtitle track across the network to copy them, and
+  # it printed nothing at all: the encoder's progress line was cleared and the
+  # next output was the length check, several minutes later, with nothing in
+  # between to say whether anything was still happening.
+  say "Muxing $(basename "$src"): copying audio, subtitles and chapters"
+  mach "@@stage mux $src"
+  local muxlog muxrc=0 tmux
+  muxlog="$(mktemp "${TMPDIR:-/tmp}/mkvshrink.mux.XXXXXX")"
+  tmux=$(date +%s)
+  "${mkv[@]}" 2>&1 | mux_filter "$muxlog" "$(basename "$src")" "$tmux" || true
+  muxrc="${PIPESTATUS[0]}"
+  # Exit 1 is warnings, and mkvmerge warns about things it then handles.
+  # Treating that as failure throws away a finished file over a note about a
+  # track header, which is a lesson this project has already paid for once.
+  if [[ "$muxrc" -eq 1 ]] && [[ -s "$out" ]]; then
+    warn "mkvmerge reported warnings on $(basename "$src"). The file is fine;
+      this is what it said:"
+    sed 's/^/      /' "$muxlog" >&2
+    muxrc=0
+  fi
+  if [[ "$muxrc" -ne 0 ]]; then
     warn "mkvmerge failed on $(basename "$src"). The original is untouched."
+    [[ -s "$muxlog" ]] && sed 's/^/      /' "$muxlog" >&2
+    rm -f "$muxlog"
     cleanup_one; return 1
   fi
+  rm -f "$muxlog"
+  say "Muxed in $(( $(date +%s) - tmux ))s"
   rm -f "$stage"
 
   # --- stereo mode and display dimensions ----------------------------------
@@ -1479,6 +1619,7 @@ shrink_one() {
   fi
 
   # --- verify --------------------------------------------------------------
+  say "Checking the output before touching the original"
   mach "@@stage verify $src"
   if ! verify_output "$src" "$out"; then
     keepwork=1
@@ -1523,12 +1664,22 @@ print("%.1f" % (100.0*(o-n)/o) if o else "0.0")' "$oldsize" "$newsize")"
     keepwork=1; return 1
   fi
 
+  # The last step, and until now an invisible one: on a large file the copy and
+  # the moves take long enough that the row sat on "verify" while the work that
+  # actually commits the result was going on.
+  mach "@@stage replace $src"
+
+  # The path here is the source, which is the key the plan and any front end
+  # hold, and it comes last because it contains spaces. Everything before it is
+  # a single token. Splitting "@@done /Volumes/video/Bond Movies/x.mkv 82.5" on
+  # spaces gave "/Volumes/video/Bond" as the path, matched no row, and left
+  # every finished file showing the stage it was in three steps earlier.
   case "$REPLACE" in
     none)
       local keepat="${dir}/${base}.shrunk.mkv"
       mv -f "$out" "$keepat"
       say "Wrote $(basename "$keepat"), saving ${saved}%. Original untouched."
-      mach "@@done $keepat $saved"
+      mach "@@done $saved kept $src"
       ;;
     folder)
       local rdir
@@ -1547,7 +1698,7 @@ print("%.1f" % (100.0*(o-n)/o) if o else "0.0")' "$oldsize" "$newsize")"
       fi
       mv -f "$out" "${dir}/$(basename "${src%.*}").mkv"
       say "Replaced $(basename "$src"), saving ${saved}%. Original in $(basename "$rdir")/"
-      mach "@@done $src $saved"
+      mach "@@done $saved moved $src"
       ;;
     insitu)
       # Rename over the top rather than truncate and rewrite: a rename is
@@ -1556,7 +1707,7 @@ print("%.1f" % (100.0*(o-n)/o) if o else "0.0")' "$oldsize" "$newsize")"
       mv -f "$out" "${dir}/$(basename "${src%.*}").mkv"
       [[ "${src##*.}" == "mkv" ]] || rm -f "$src"
       say "Replaced $(basename "$src") in place, saving ${saved}%"
-      mach "@@done $src $saved"
+      mach "@@done $saved replaced $src"
       ;;
   esac
 
@@ -1601,6 +1752,12 @@ collect_inputs() {
 plan_reason() {
   local r=""
   [[ -n "${D_REASON:-}" ]] && r="$D_REASON"
+  # Before the audio marker, which reads to the end of the string because the
+  # language list it carries is comma separated too.
+  if [[ "${IS_HI10P:-0}" == "1" ]]; then
+    [[ -n "$r" ]] && r="$r,"
+    r="${r}hi10p"
+  fi
   if [[ -n "${AUDIO_LOST_LANGS:-}" ]]; then
     [[ -n "$r" ]] && r="$r,"
     r="${r}drops-audio:${AUDIO_LOST_LANGS}"
@@ -1634,6 +1791,7 @@ analyse() {
   # as fifteen consecutive rows sharing one PSNR, which reads as a measurement
   # rather than as the absence of one.
   PE_RATIO=""; PE_PSNR=""; PE_SSIM=""; PE_PROBES=0
+  PE_BEST=""; PE_WORST=""; PE_SPREAD=""
   AUDIO_LOST_LANGS=""; AUDIO_KEEP_LANGS=""
   probe_file "$f"
   if [[ "$P_OK" != "1" ]]; then
@@ -1642,6 +1800,15 @@ analyse() {
     return 0
   fi
   [[ -n "${WARNINGS:-}" ]] && warn "$(basename "$f"): $WARNINGS"
+  # Said before any gate can skip the file, because on this one the gates are
+  # answering the wrong question. A 10-bit H.264 file is not a file that could
+  # be smaller, it is a file that does not play.
+  if [[ "${IS_HI10P:-0}" == "1" ]]; then
+    say "$(basename "$f"): 10-bit H.264. No consumer hardware decoder handles
+      this profile, so it transcodes on playback whatever its size. Converting
+      it is worth doing at any saving, including none. If a gate skips it,
+      that gate is measuring bytes and this is not about bytes: --force."
+  fi
   # Loud, because it is the one selection mistake you cannot see in the plan's
   # ID columns and cannot undo once the original is gone.
   if [[ -n "${AUDIO_LOST_LANGS:-}" ]]; then
@@ -1723,7 +1890,22 @@ print("%d %.1f" % (pred / 1048576, 100.0 * (total - pred) / total))
       # of the sampled windows, so a number drawn from one surviving window is
       # a much weaker claim than the same number drawn from three, and nothing
       # else in the output would tell you which you were looking at.
-      say "$(basename "$f"): probe ratio ${PE_RATIO}, PSNR ${PE_PSNR:-?} dB, SSIM ${PE_SSIM:-?}, predicted saving ${PLAN_SAVE}% (from ${PE_PROBES:-?} probe window(s))"
+      # Risk is measured for every candidate, not only for plans, so it gets
+      # said here too. Measuring a number and then not printing it is what
+      # happened to SSIM for twenty-four builds.
+      say "$(basename "$f"): probe ratio ${PE_RATIO}, PSNR ${PE_PSNR:-?} dB, SSIM ${PE_SSIM:-?}, banding risk ${PLAN_RISK:--}%, predicted saving ${PLAN_SAVE}% (from ${PE_PROBES:-?} probe window(s))"
+      # Three windows that disagree are three windows measuring three
+      # different films. The prediction is a byte total, so one nearly static
+      # window can carry it, and the number that comes out looks exactly as
+      # confident as one from three windows that agreed.
+      if [[ -n "${PE_SPREAD:-}" ]] && python3 -c \
+        'import sys;sys.exit(0 if float(sys.argv[1])>=3.0 else 1)' \
+        "$PE_SPREAD" 2>/dev/null; then
+        warn "$(basename "$f"): the probe windows disagree by ${PE_SPREAD}x
+      (best ${PE_BEST:-?}, worst ${PE_WORST:-?}). One of them is not
+      representative, usually a static or near black scene. Run --probes 6
+      before trusting the saving."
+      fi
       # A quality floor is worth more than a size floor. An encode that passes
       # every structural check and still looks like mush is the failure the
       # exit status cannot see.
@@ -2132,6 +2314,20 @@ apply_plan() {
   local n=0 done=0 failed=0 skipped=0
   local action akeep skeep save psnr ssim risk size pred uid path reason
   local -a f
+  # A first pass for the totals. Without it the sweep line can only count up
+  # from one with no idea what it is counting towards, and a front end showing
+  # "0 of 8" for two hours is worse than showing nothing.
+  SWEEP_TOTAL=0; SWEEP_BYTES_TODO=0; SWEEP_BYTES_DONE=0; SWEEP_INDEX=0
+  while IFS=$'\t' read -r -a f; do
+    [[ ${#f[@]} -ge 10 ]] || continue
+    [[ -z "${f[0]}" || "${f[0]}" == \#* || "${f[0]}" == "skip" ]] && continue
+    local _s="${f[7]}"
+    [[ ${#f[@]} -ge 12 ]] || _s="${f[5]}"
+    [[ "$_s" =~ ^[0-9]+$ ]] || _s=0
+    SWEEP_TOTAL=$((SWEEP_TOTAL + 1))
+    SWEEP_BYTES_TODO=$((SWEEP_BYTES_TODO + _s * 1048576))
+  done < "$plan"
+  SWEEP_T0=$(date +%s)
   # save, size, pred, psnr, ssim, risk and reason are read for their column
   # position only. The file is re-probed here rather than trusted, because the
   # plan may be old.
@@ -2194,13 +2390,20 @@ apply_plan() {
     # rules or a decision somebody made.
     local tracksrc="rules"
     [[ "$akeep" == "${AUDIO_KEEP}" && "$skeep" == "${SUBS_KEEP}" ]] || tracksrc="manual"
+    local _sz; _sz=$(filesize "$path")
+    SWEEP_INDEX=$((SWEEP_INDEX + 1))
     if shrink_one "$path" "$action" "$akeep" "$skeep" "$tracksrc"; then
       done=$((done + 1))
     else
       failed=$((failed + 1))
     fi
+    SWEEP_BYTES_DONE=$((SWEEP_BYTES_DONE + _sz))
+    SWEEP_BYTES_TODO=$((SWEEP_BYTES_TODO > _sz ? SWEEP_BYTES_TODO - _sz : 0))
+    sweep_progress "$SWEEP_INDEX" "$SWEEP_TOTAL"
   done < "$plan"
   say "Plan finished: $done done, $skipped skipped, $failed failed, of $n rows"
+  [[ -n "${LOGFILE:-}" ]] && say "Log: $LOGFILE"
+  mach "@@summary $done $skipped $failed"
 }
 
 # ---------------------------- main ------------------------------------------
@@ -2255,6 +2458,7 @@ TOTAL_DONE=0; TOTAL_FAILED=0; TOTAL_SKIPPED=0
 SWEEP_T0=$(date +%s)
 SWEEP_BYTES_DONE=0
 SWEEP_BYTES_TODO=0
+SWEEP_TOTAL=0
 for _f in "${FILES[@]}"; do
   SWEEP_BYTES_TODO=$(( SWEEP_BYTES_TODO + $(filesize "$_f") ))
 done
@@ -2292,4 +2496,5 @@ for f in "${FILES[@]}"; do
 done
 
 say "Done: $TOTAL_DONE processed, $TOTAL_SKIPPED skipped, $TOTAL_FAILED failed"
+[[ -n "${LOGFILE:-}" ]] && say "Log: $LOGFILE"
 mach "@@summary $TOTAL_DONE $TOTAL_SKIPPED $TOTAL_FAILED"

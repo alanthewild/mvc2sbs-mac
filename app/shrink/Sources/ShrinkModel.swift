@@ -180,6 +180,33 @@ final class PlanRow: ObservableObject, Identifiable {
     @Published var state: String = ""
     @Published var progress: Double = 0
     @Published var savedPct: String = ""
+    /// How the finished file landed: kept, moved or replaced. Reported by
+    /// mkvshrink rather than read from the current settings, because the
+    /// setting can be changed while a queue is running and the row should say
+    /// what happened to that file, not what would happen to the next one.
+    @Published var landed: String = ""
+
+    /// What the row says once it is finished. The state word alone said
+    /// "verify", which was the last stage that emitted an event, so a
+    /// completed file looked like one stuck mid-check.
+    var finishedLine: String {
+        var s = "Finished"
+        if let pct = Double(savedPct), pct > 0 {
+            s += String(format: ", %.1f%% smaller", pct)
+        }
+        switch landed {
+        case "kept":     s += ", written beside the original as \(baseName).shrunk.mkv"
+        case "moved":    s += ", original moved to _replaced"
+        case "replaced": s += ", original replaced in place"
+        default: break
+        }
+        return s
+    }
+
+    /// The file name without its extension, for the .shrunk.mkv line.
+    var baseName: String {
+        (name as NSString).deletingPathExtension
+    }
 
     var name: String { (path as NSString).lastPathComponent }
     var folder: String { (path as NSString).deletingLastPathComponent }
@@ -189,6 +216,12 @@ final class PlanRow: ObservableObject, Identifiable {
     /// columns cannot show and that nothing can undo once the original is
     /// gone, so it is flagged rather than left in a string.
     var dropsAudioLang: Bool { reason.contains("drops-audio:") }
+
+    /// 10-bit H.264, which no consumer hardware decoder will take. The gates
+    /// here measure bytes, and this file's problem is not bytes: it transcodes
+    /// on playback whatever its size, so converting it is worth doing at any
+    /// saving. Worth pointing at rather than leaving in a reason string.
+    var hi10p: Bool { reason.contains("hi10p") }
 
     /// The languages in question, for the sheet's warning line. Read to the
     /// end of the string rather than to the next comma: the marker is written

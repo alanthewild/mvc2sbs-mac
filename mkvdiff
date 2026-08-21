@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-VERSION="3.71"
+VERSION="3.72"
 
 TMPDIR_ERR="$(mktemp "${TMPDIR:-/tmp}/mkvdiff.err.XXXXXX")"
 trap 'rm -f "$TMPDIR_ERR"' EXIT

@@ -34,6 +34,31 @@ Gates run cheapest first:
 | min PSNR | 40 dB | See "PSNR is not a quality gate" below. Consider running with `--min-psnr 0`. |
 | min saving | 10% | Measured against the free lossless remux, not against doing nothing. |
 
+The probe stage, which is what makes a scan minutes per file:
+
+- Three 20 second windows at 20%, 45% and 70% of the running time. The body of
+  the film: openings are the cheapest minute of most films and credits are
+  cheaper still. `--probes` and `--probe-len` change both, and more than three
+  windows spread evenly across the same range.
+- Cut with `ffmpeg -ss`, which seeks. `mkvmerge --split parts:` does not: it
+  reads from byte zero and discards everything outside the window, which on a
+  56 GB remux is 39 GB across the network before a frame is encoded, on a file
+  it may then reject.
+- Each window is encoded with the settings in force and compared against that
+  same cut. Ratio is bytes out over bytes in. PSNR and SSIM pair frames by
+  position rather than by timestamp, because a stream copy and a re-encode
+  disagree in the millisecond after rounding and matching on PTS compares
+  frame N with frame N-1, reporting about 27 dB on content that is really 43.
+- The reported ratio is the byte total over every window, so a big scene counts
+  for more than a small one. The reported PSNR and SSIM are the worst window,
+  not the mean: a file that holds up twice and falls apart once is a file that
+  falls apart.
+- A window that comes back short is discarded, and so is an encode that stopped
+  early. Both look like spectacular savings and the second one argues for
+  re-encoding a file it has not actually measured.
+- Windows that disagree by more than 3x are reported. The total cannot show
+  that one of them was a still or a near black scene.
+
 Probe accuracy measured against actual output: Akira predicted 51.9% and
 delivered 55.7%; GoodFellas predicted 67.0% and delivered 57.8%. Treat the
 prediction as plus or minus 10 points. It is good enough to decide whether to
@@ -64,13 +89,14 @@ direct unattended run can still lose original audio.
 
 ## PSNR is not a quality gate
 
-Measured across four films, PSNR did not predict what the eye saw.
+Measured across five films, PSNR did not predict what the eye saw.
 
 | Film | PSNR | Ratio | Verdict |
 | --- | --- | --- | --- |
 | A Silent Voice (2016) | 47.4 | 0.06 | clean, 72.5% saved |
 | Akira (1988) | 46.8 | 0.48 | clean over an hour, 55.7% saved |
 | Princess Mononoke (1997) | 35.2 | 0.66 | clean |
+| Casino Royale (2006) | 38.8 | 0.52 | 48% saved, crushing in two near-black scenes |
 | Blade Runner 2049 (2017) | ~39 | 0.27 | crushed blacks, banding |
 
 The only failure scored higher than a film that was fine. Low PSNR on grainy
@@ -88,6 +114,14 @@ Two signatures appear to differ, on limited evidence:
   Usually invisible. Princess Mononoke, GoodFellas, Saving Private Ryan.
 
 This is a hypothesis from four films, not an established rule.
+
+Casino Royale is the first result that tests the floor directly. It probed at
+38.8 dB, below the 40 dB floor, and was demoted to strip. Forced through
+anyway it saved 48% and looked right everywhere except two almost entirely
+black scenes at the start, which showed some crushing. So the floor was
+pointing at something real and was over-cautious about it: the failure was two
+scenes, not a film. Watch the darkest few minutes of anything that scores near
+the floor rather than trusting or dismissing the number.
 
 ## --luma
 
@@ -153,11 +187,28 @@ of a decibel of each other is the content speaking, not the encoder.
 ```
 @@progress file=NAME pct=63.4 fps=184 speed=7.66 eta=319 elapsed=652
 @@sweep index=23 total=60 elapsed=8100 done_bytes=... todo_bytes=...
-@@done PATH SAVED
+@@stage encode|strip|mux|verify|replace PATH
+@@done SAVED kept|moved|replaced PATH
+@@failed PATH
 @@summary DONE SKIPPED FAILED
 ```
 
+A path is the only field that can contain a space, so it is always last and a
+reader must stop splitting before it. `@@done` used to put it first, which
+split every film with a space in its name at the first word, matched no row in
+the GUI, and left finished files displaying whatever stage they had been in
+several steps earlier.
+
 The console display is a consumer of the same data, so neither owns it.
+`@@sweep` and `@@summary` are emitted by `--apply` as well as by a direct run.
+
+## Logs
+
+Every run writes its console output to `~/Library/Logs/mkvshrink`, one file per
+run, with the colour codes and the progress redraws stripped out at exit.
+`--log FILE` picks a specific file, `--log-dir DIR` a different folder, and
+`--log-dir none` turns it off. Not into the media folder: a library gets
+scanned, and a stray `.log` in it is clutter.
 
 ## Plan format
 

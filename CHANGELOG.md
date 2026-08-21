@@ -1,5 +1,120 @@
 # Changelog
 
+## 3.72
+
+- **The banding risk is printed on a single file run**, not only written into
+  a plan. It was measured either way, which meant a direct run spent the seeks
+  and threw the number away. That is exactly what happened to SSIM for
+  twenty-four builds.
+- **Finished files said "verify" and nothing else.** `@@done` put the path
+  first and the saving second, and a film called "For Your Eyes Only (1981)"
+  split at the first space, so the row it belonged to was never found. The
+  file was left showing the last stage that did match, which was the check
+  three steps earlier. The path is now last, where the field that can contain
+  a space belongs, and the reader stops splitting before it.
+- **The row now says what happened**, not which event fired: "Finished, 78.4%
+  smaller, written beside the original as NAME.shrunk.mkv", with a green tick.
+  The wording follows what was actually done to that file, reported by the
+  script rather than read from the current setting, so a queue whose setting
+  changed halfway still describes each file correctly: kept, original moved to
+  _replaced, or original replaced in place.
+- **The stages read as English.** encode, mux, verify and strip were event
+  names from a shell script. They now say what is happening to the film, and
+  the last step, which used to be invisible, says whether it is writing the
+  new file, moving the original aside, or replacing it.
+- **A file interrupted mid-run says so.** Anything still in flight when a run
+  is stopped now reads "Stopped before it finished. The original is untouched"
+  rather than silently clearing, which looked like completion.
+- **A test on the event interface.** Any `@@` field that can hold a space must
+  be last and the reader must stop splitting before it, and every stage the
+  script emits must have a label in the table. Both directions verified by
+  breaking them.
+- **A help section on how the plan gets made**, which was the missing step:
+  the help explained how to read a plan and never said where one came from.
+  Scan is the expensive half. It cuts three 20 second windows at 20%, 45% and
+  70% of the running time, encodes each for real with the settings in force,
+  and measures the byte ratio, PSNR and SSIM against those same cuts. Why it
+  encodes rather than reading metadata, why it seeks rather than letting
+  mkvmerge read from byte zero, why the ratio is a byte total and the PSNR is
+  the worst window, and what makes a window get thrown away.
+- **`--probes` above 3 was accepted and ignored.** The sample points were a
+  list of three fractions that `n` only sliced, so `--probes 6` measured three
+  windows and reported a more confident number for exactly the same evidence.
+  It now spreads n windows across the body of the film. Three keeps its
+  historical placement so every figure in the docs stays reproducible.
+- **The help says the gates are yours to move.** The 5 GB minimum read as a
+  rule rather than a default. It, the minimum saving, the PSNR floor and the
+  probe count are all in Settings, and the help now says so and says what
+  moving each one costs.
+- **The original language section says what to do about it**, not just that
+  the problem exists. It was written before there was an answer: now the row
+  turns orange, the Tracks button opens the file's real track list, and
+  ticking a dropped language keeps it for that file whatever the whitelist
+  says.
+- **The help index test covers both apps.** MKVShrink's help had grown to 36
+  rows with nothing checking it, and a duplicate heading silently drops a row
+  rather than failing to compile. Verified by introducing one.
+- **The work is done in the order shown.** The plan was written in the order
+  the folders were scanned, so sorting the table by saving and pressing Start
+  did the biggest wins whenever they happened to come up. The plan handed to
+  `--apply` is now written in the table's order, and the status bar says the
+  queue runs top to bottom.
+- **"0 of 8" is fixed.** `--apply` never emitted a sweep event, so the count
+  never moved and there was no total to count towards. It now emits one per
+  file, and a first pass over the plan works out the total and the bytes
+  before starting. It also emits the summary line at the end, which it never
+  did either.
+- **A batch ETA beside the per file one.** Worked out from how long the run
+  has taken so far per gigabyte, measured in the app rather than taken from
+  the script, because the script only reports when a file finishes and the
+  first file is when you most want an estimate. A strip row is a remux and a
+  shrink row is twenty minutes, so a mixed queue drifts, and the tooltip says
+  so.
+- **mkvshrink writes a log per run**, to `~/Library/Logs/mkvshrink`, the same
+  arrangement mvc2sbs has: everything on stderr is copied out, and the colour
+  codes and progress redraws are stripped from the file at exit. `--log` and
+  `--log-dir` control it, `--log-dir none` turns it off. The Console gains
+  Save, Clear and Log folder to match the other app.
+- **The originals banner says where the files go.** Keeping originals writes
+  `NAME.shrunk.mkv` beside the source; the `_replaced` folder sits beside each
+  file. Both were questions with an exact answer that could only be answered
+  by going and looking afterwards.
+- **Casino Royale is recorded as a result.** It probed at 38.8 dB, below the
+  40 dB floor, and was demoted to strip. Forced through it saved 48% and
+  looked right everywhere except two almost entirely black scenes at the
+  start, which crushed. That makes it the first case where the floor was
+  pointing at something real rather than at grain, and it was still
+  over-cautious: the damage was two scenes, not a film. Documented in
+  docs/mkvshrink.md and in the app's help.
+- **The mux step no longer goes silent for minutes.** When the encode
+  finished, its progress line was cleared and nothing else printed until the
+  length check, which on a 60 GB source is several minutes of a terminal that
+  looks hung. mkvmerge is now run in `--gui-mode` and its progress is drawn as
+  a bar, the step says what it is doing (copying audio, subtitles and
+  chapters), and it reports how long it took. The verify step and the copy to
+  another volume announce themselves too.
+- **mkvmerge exit 1 is warnings, not failure.** It was treated as failure
+  here, which throws away a finished encode over a note about a track header.
+  Same fault as mvc2sbs had, same fix: if the file exists, print what mkvmerge
+  said and carry on.
+- **10-bit H.264 is detected and called out**, as `hi10p` in the plan's reason
+  column and as a note during a single file run. Anime releases use this
+  profile constantly and no consumer hardware decoder takes it: measured on
+  the Shield this project is tested against, it is refused outright with
+  "the video codec's profile is not supported" and transcoded, while HEVC
+  Main 10 plays. That makes converting one worth doing at any saving,
+  including none, which is the opposite of every other rule in the tool. The
+  gates still apply, because they are about bytes, but the file now says why
+  they are answering the wrong question.
+- **A warning when the probe windows disagree.** The prediction is a byte
+  total across every window, so one nearly static window can carry it, and the
+  number that comes out looks as confident as one from three windows that
+  agreed. Chainsaw Man measured 0.23, 0.04 and 0.18, a spread of 5.7x, and
+  reported a single 81.4% saving with nothing to say the middle window was a
+  different kind of scene. Anything over 3x now says so and suggests
+  `--probes 6`.
+
+
 ## 3.71
 
 - **The planning screen explains what a probe encode is** rather than using the

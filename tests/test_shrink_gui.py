@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = (ROOT / "mkvshrink").read_text()
 MODEL = (ROOT / "app/shrink/Sources/ShrinkModel.swift").read_text()
 RUNNER = (ROOT / "app/shrink/Sources/ShrinkRunner.swift").read_text()
+VIEW = (ROOT / "app/shrink/Sources/ShrinkView.swift").read_text()
 
 failures = []
 
@@ -141,6 +142,46 @@ else:
         failures.append(
             "apply_plan does not branch on the %d column shape it now writes"
             % len(cols))
+
+# --- the @@ events are an interface too ------------------------------------
+# Film paths contain spaces. Any event field that can contain one has to be
+# last, and the reader has to stop splitting before it. "@@done PATH SAVED"
+# looked fine in the docs and broke every completed row in the table: the path
+# split at the first space, matched no row, and the file kept showing whatever
+# stage it had been in three steps earlier.
+done_events = re.findall(r'mach "@@done ([^"]*)"', SCRIPT)
+if not done_events:
+    failures.append("mkvshrink emits no @@done event")
+for ev in done_events:
+    fields = ev.split()
+    if not fields[-1].startswith("$"):
+        failures.append(
+            "@@done ends with %r, which is not the path.\n"
+            "     A path contains spaces, so it has to be the last field."
+            % fields[-1])
+    for f in fields[:-1]:
+        if f.startswith("$") and "path" in f.lower() or f in ("$src", "$keepat"):
+            failures.append(
+                "@@done has %s before the last field, and a path there splits "
+                "on its own spaces" % f)
+
+m = re.search(r'case "done":(.*?)case "', RUNNER, re.S)
+if not m:
+    failures.append("cannot find the done event handler in ShrinkRunner.swift")
+elif "maxSplits" not in m.group(1):
+    failures.append(
+        "the done handler splits the whole event on spaces.\n"
+        "     The path is the last field and contains spaces, so it needs "
+        "maxSplits.")
+
+# Every stage the script emits should have a label in the table, or a row
+# shows a bare event name from a shell script to somebody watching a film
+# encode.
+stages = set(re.findall(r'mach "@@stage (\w+)', SCRIPT))
+for st in sorted(stages):
+    if '"%s"' % st not in VIEW:
+        failures.append(
+            "mkvshrink emits stage %r and the table has no label for it" % st)
 
 # --- defaults must agree ---------------------------------------------------
 def script_default(var):

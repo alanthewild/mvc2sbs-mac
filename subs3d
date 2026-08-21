@@ -36,7 +36,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "3.71"
+VERSION = "3.72"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)

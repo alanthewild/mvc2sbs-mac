@@ -56,7 +56,7 @@ struct ShrinkContentView: View {
         .confirmationDialog(applyQuestion,
                             isPresented: $confirmApply, titleVisibility: .visible) {
             Button("Yes", role: .destructive) {
-                ctl.apply(settings: defaults.settings, only: onlyRow)
+                ctl.apply(settings: defaults.settings, order: sortedRows, only: onlyRow)
                 onlyRow = nil
             }
             Button("No", role: .cancel) { onlyRow = nil }
@@ -407,9 +407,41 @@ struct PlanRowView: View {
     private var stateColour: Color {
         switch row.state {
         case "done": return .green
-        case "failed": return .red
-        case "running", "encode", "verify", "strip", "mux": return .accentColor
+        case "failed", "missing": return .red
+        case "stopped": return .orange
+        case "running", "encode", "verify", "strip", "mux", "replace":
+            return .accentColor
         default: return .secondary
+        }
+    }
+
+    /// The stage words come from the script, where they are event names. A
+    /// person reading a table wants to know what is happening to their film.
+    private var stateLabel: String {
+        switch row.state {
+        case "done":     return row.finishedLine
+        case "failed":   return "Failed. The original is untouched, see the Console"
+        case "missing":  return "Not where the plan says it is"
+        case "encode", "running": return "Encoding the video"
+        case "strip":    return "Remuxing, no re-encode"
+        case "mux":      return "Copying audio, subtitles and chapters"
+        case "verify":   return "Checking the output before touching the original"
+        case "replace":  return replaceLabel
+        case "waiting":  return "Waiting"
+        case "stopped":  return "Stopped before it finished. The original is untouched"
+        default:         return row.state
+        }
+    }
+
+    /// The last step says what it is about to do, which is the one moment the
+    /// answer differs by setting: in place is the only one that touches the
+    /// original file itself.
+    private var replaceLabel: String {
+        switch row.landed {
+        case "kept":     return "Writing the new file"
+        case "moved":    return "Moving the original to _replaced"
+        case "replaced": return "Replacing the original"
+        default:         return "Putting the finished file in place"
         }
     }
 
@@ -473,19 +505,23 @@ struct PlanRowView: View {
                 Text(row.reason.isEmpty ? "-" : row.reason)
                     .frame(width: 190, alignment: .leading)
                     .lineLimit(1).truncationMode(.tail)
-                    .foregroundColor(.secondary)
-                    .help(row.reason)
+                    .foregroundColor(row.hi10p ? .accentColor : .secondary)
+                    .help(row.hi10p
+                          ? "10-bit H.264. No consumer hardware decoder takes this profile, so it transcodes on playback whatever its size. Worth converting at any saving, including none.\n\n" + row.reason
+                          : row.reason)
             }
             .font(.system(size: 12))
 
             if !row.state.isEmpty && row.state != "not selected" {
                 HStack(spacing: 8) {
-                    Text(row.state).font(.caption2).foregroundColor(stateColour)
+                    if row.state == "done" {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.caption2).foregroundColor(.green)
+                    }
+                    Text(stateLabel).font(.caption2).foregroundColor(stateColour)
+                        .lineLimit(1).truncationMode(.middle)
                     if row.progress > 0 && row.progress < 1 {
                         ProgressView(value: row.progress).frame(width: 160)
-                    }
-                    if !row.savedPct.isEmpty {
-                        Text("saved " + row.savedPct).font(.caption2).foregroundColor(.green)
                     }
                     Spacer()
                 }
@@ -625,7 +661,10 @@ struct ShrinkStatusBar: View {
     var body: some View {
         HStack(spacing: 16) {
             if ctl.running {
-                Text("\(ctl.sweepIndex) of \(ctl.sweepTotal)")
+                // The index counts files that have finished, so the one being
+                // worked on is index + 1. Reporting "0 of 8" while the first
+                // file encodes is arithmetically true and reads as stuck.
+                Text("\(min(ctl.sweepIndex + 1, max(1, ctl.sweepTotal))) of \(ctl.sweepTotal)")
                 Text(ctl.currentFile).lineLimit(1).truncationMode(.middle)
                 if ctl.currentPct > 0 {
                     ProgressView(value: ctl.currentPct / 100).frame(width: 140)
@@ -633,6 +672,11 @@ struct ShrinkStatusBar: View {
                 }
                 if !ctl.speed.isEmpty { Text(ctl.speed).foregroundColor(.secondary) }
                 Text("ETA " + ShrinkController.clock(ctl.eta)).foregroundColor(.secondary)
+                    .help("This file")
+                Text("Batch " + (ctl.batchETA > 0
+                                 ? ShrinkController.clock(ctl.batchETA) : "--:--:--"))
+                    .foregroundColor(.secondary)
+                    .help("The whole queue, from how long this run has taken so far per gigabyte. A strip row is a remux and finishes in a minute where a shrink row of the same size takes twenty, so a mixed queue drifts.")
             } else if ctl.scanning {
                 Text("Planning. Nothing on disk is being changed.")
             } else if !ctl.lastSummary.isEmpty {
@@ -643,6 +687,11 @@ struct ShrinkStatusBar: View {
                 Text("\(ctl.selectedCount) of \(ctl.rows.count) selected")
                 Text("about " + ShrinkController.humanMB(ctl.selectedReclaimMB) + " to reclaim")
                     .foregroundColor(.green)
+                if ctl.selectedCount > 1 {
+                    Text("processed top to bottom in the order shown")
+                        .foregroundColor(.secondary)
+                        .help("Sort the table before starting and the work follows that order. Sorting by saving does the biggest wins first.")
+                }
             }
             Spacer()
             // Never the warning text itself. mkvshrink explains its decisions
@@ -727,14 +776,17 @@ struct ShrinkPolicyBanner: View {
         }
     }
 
+    /// Says where the files go, not just what happens to them. Both of these
+    /// are questions with an exact answer, and both were being answered by
+    /// going and looking in the folder afterwards.
     private var detail: String {
         switch policy {
         case .keep:
-            return "Nothing is reclaimed until you delete them yourself."
+            return "The new file is written beside the original as NAME.shrunk.mkv. Nothing is reclaimed until you delete the originals yourself."
         case .folder:
-            return "Each one moves after every check passes. Disk comes back when you empty the folder."
+            return "The new file takes the original's name, and the original moves to a _replaced folder beside it, once every check passes."
         case .insitu:
-            return "Nothing to undo. This mode is recorded as untested on real media."
+            return "The original is replaced by rename and there is nothing to undo. Recorded as untested on real media."
         }
     }
 
@@ -744,6 +796,7 @@ struct ShrinkPolicyBanner: View {
             Text(headline).font(.system(size: 13, weight: .bold)).foregroundColor(tint)
             Text(detail).font(.caption).foregroundColor(.secondary)
                 .lineLimit(1).truncationMode(.tail)
+                .help(detail)
             Spacer()
             Button("Change in Settings", action: onSettings)
                 .buttonStyle(.link)
@@ -774,19 +827,46 @@ struct ShrinkWarningStrip: View {
 
 struct ShrinkConsoleSheet: View {
     @EnvironmentObject var ctl: ShrinkController
+    @State private var confirmClear = false
 
     var body: some View {
         VStack(alignment: .leading) {
             HStack {
                 Text("Console").font(.headline)
                 Spacer()
+                Button("Save...") { save() }
+                    .disabled(ctl.log.isEmpty)
+                Button("Clear") { confirmClear = true }
+                    .disabled(ctl.log.isEmpty)
+                Button("Log folder") {
+                    try? FileManager.default.createDirectory(
+                        atPath: ShrinkController.logDir, withIntermediateDirectories: true)
+                    NSWorkspace.shared.open(URL(fileURLWithPath: ShrinkController.logDir))
+                }
                 Button("Close") { ctl.consoleVisible = false }
             }
             ShrinkLogView(text: ctl.log)
                 .background(Color.black.opacity(0.25))
+            Text("Every run also writes its own log to " + ShrinkController.logDir)
+                .font(.caption).foregroundColor(.secondary)
+                .textSelection(.enabled)
         }
         .padding(16)
         .frame(width: 900, height: 560)
+        .confirmationDialog("Clear the console?", isPresented: $confirmClear,
+                            titleVisibility: .visible) {
+            Button("Clear", role: .destructive) { ctl.clearLog() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This only empties the window. The log file for each run is kept on disk.")
+        }
+    }
+
+    private func save() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "mkvshrink.log"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? ctl.log.write(to: url, atomically: true, encoding: .utf8)
     }
 }
 

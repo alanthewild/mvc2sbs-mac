@@ -36,6 +36,12 @@ final class ShrinkController: ObservableObject {
     /// third of one, which is worse than showing none.
     @Published var noteCount = 0
     @Published var scannedFolders: [String] = []
+    /// For the batch estimate. Measured here rather than taken from the
+    /// script's sweep line, because that only updates when a file finishes and
+    /// the first file of a run is the one you most want an estimate during.
+    @Published var applyStart: Date?
+    @Published var queuedMB: Double = 0
+    @Published var batchETA: TimeInterval = 0
 
     private var process: Process?
     private var stdoutBuffer = Data()
@@ -64,6 +70,18 @@ final class ShrinkController: ObservableObject {
             toolWarning = "Not found: " + missing.joined(separator: ", ")
                 + ". Install with: brew install ffmpeg mkvtoolnix"
         }
+    }
+
+    /// Where mkvshrink writes its own log, one file per run. The app shows the
+    /// same output live; this is the copy that survives the window closing.
+    static var logDir: String {
+        (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Library/Logs/mkvshrink")
+    }
+
+    func clearLog() {
+        log = ""
+        noteCount = 0
     }
 
     func appendLog(_ s: String) {
@@ -154,9 +172,16 @@ final class ShrinkController: ObservableObject {
     /// `only` runs one row and leaves every tick where it is, which is the
     /// difference between trying a setting on one film and committing to a
     /// sweep of twenty-five.
-    func apply(settings: ShrinkSettings, only: PlanRow? = nil) {
+    /// `order` is the order the table is showing, which is the order the work
+    /// is done in. The plan is written in that order and mkvshrink walks it
+    /// top to bottom, so sorting by saving and pressing Start reclaims the
+    /// most disk soonest. Before this the plan kept the order the folder was
+    /// scanned in, which matched nothing on screen.
+    func apply(settings: ShrinkSettings, order: [PlanRow]? = nil,
+               only: PlanRow? = nil) {
         guard !scanning, !running, let tool = Tools.find("mkvshrink") else { return }
-        let included = only.map { [$0] } ?? rows.filter { $0.include }
+        let ordered = order ?? rows
+        let included = only.map { [$0] } ?? ordered.filter { $0.include }
         guard !included.isEmpty else {
             message = "Nothing is ticked."
             return
@@ -184,6 +209,8 @@ final class ShrinkController: ObservableObject {
         lastSummary = ""
         sweepIndex = 0
         sweepTotal = included.count
+        applyStart = Date()
+        queuedMB = included.reduce(0) { $0 + $1.sizeMB }
 
         var args = ["--machine", "--apply", plan.path]
         args += settings.arguments
@@ -193,8 +220,14 @@ final class ShrinkController: ObservableObject {
             self.stage = ""
             self.currentFile = ""
             self.currentPct = 0
-            for r in self.rows where r.state == "waiting" || r.state == "running" {
-                r.state = ""
+            self.batchETA = 0
+            self.applyStart = nil
+            // Anything still mid-flight when the run ended was stopped rather
+            // than finished, and saying nothing leaves it looking done.
+            for r in self.rows where !["done", "failed", "missing", "",
+                                       "not selected"].contains(r.state) {
+                r.state = r.progress > 0 ? "stopped" : ""
+                r.progress = 0
             }
         }
     }
@@ -344,18 +377,24 @@ final class ShrinkController: ObservableObject {
                 r.progress = currentPct / 100.0
                 r.state = "running"
             }
+            updateBatchETA()
         case "sweep":
             sweepIndex = Int(kv["index"] ?? "") ?? sweepIndex
             sweepTotal = Int(kv["total"] ?? "") ?? sweepTotal
             elapsed = Double(kv["elapsed"] ?? "") ?? elapsed
+            updateBatchETA()
         case "done":
-            let parts = rest.split(separator: " ").map(String.init)
-            if let path = parts.first {
-                let r = row(forPath: path)
-                    ?? rows.first { path.hasSuffix($0.name) }
+            // "@@done <saved> <how> <path>". The path is last because it is
+            // the only field that can contain a space, and it is the source
+            // path because that is the key the plan holds.
+            let parts = rest.split(separator: " ", maxSplits: 2).map(String.init)
+            if parts.count >= 3 {
+                let path = parts[2]
+                let r = row(forPath: path) ?? rows.first { path.hasSuffix($0.name) }
                 r?.state = "done"
                 r?.progress = 1
-                if parts.count > 1 { r?.savedPct = parts[1] }
+                r?.savedPct = parts[0]
+                r?.landed = parts[1]
             }
         case "failed":
             let path = rest.trimmingCharacters(in: .whitespaces)
@@ -373,6 +412,34 @@ final class ShrinkController: ObservableObject {
         default:
             break
         }
+    }
+
+    /// How long the rest of the run will take, from how long this run has
+    /// taken so far per megabyte processed.
+    ///
+    /// Bytes rather than file count, because these files are not the same
+    /// size, and measured from this run rather than from a fixed rate,
+    /// because the rate depends on the source. It is still only an estimate:
+    /// a strip row is a remux and finishes in a minute where a shrink row of
+    /// the same size takes twenty, so a mixed queue will drift.
+    private func updateBatchETA() {
+        guard running, let start = applyStart, queuedMB > 0 else {
+            batchETA = 0
+            return
+        }
+        var doneMB = rows.filter { $0.state == "done" || $0.state == "failed" }
+            .reduce(0.0) { $0 + $1.sizeMB }
+        if let cur = rows.first(where: { $0.state == "running" || $0.progress > 0
+                                         && $0.state != "done" }) {
+            doneMB += cur.sizeMB * min(1, max(0, cur.progress))
+        }
+        let elapsed = Date().timeIntervalSince(start)
+        guard doneMB > 0, elapsed > 5 else {
+            batchETA = 0
+            return
+        }
+        let rate = doneMB / elapsed
+        batchETA = max(0, (queuedMB - doneMB) / rate)
     }
 
     // MARK: - Totals for the status bar
