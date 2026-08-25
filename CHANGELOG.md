@@ -1,5 +1,39 @@
 # Changelog
 
+## 3.73
+
+- **Ticking a dropped language back on did not clear the warning.** The reason
+  column is written when the plan is made, and it is a fixed string: tick the
+  Japanese track and the row went on saying `drops-audio:jpn`, and so did the
+  orange warning in the sheet. The file did keep the track, because the audio
+  column is what mkvshrink reads and the reason column is only text, but the
+  screen said otherwise. Verified end to end here before changing anything:
+  a two-track file planned with `--audio-langs eng` dropped jpn, the audio
+  column was edited to `1,2` as the GUI writes it, and the output has both
+  tracks with jpn intact. So nothing was ever lost, and the display was
+  telling people it had been, on the one edit that exists to prevent exactly
+  that. The row and the sheet now recompute which languages lose every track
+  from the ticks as they stand, the reason reads `tracks edited`, and the
+  warning clears the moment you tick the track.
+- **The About box names the build.** Both build scripts hardcoded
+  `CFBundleVersion` to 1, so every app ever built reported "3.72 (1)" and the
+  one question a build number exists to answer went unanswered. MKVShrink now
+  carries mkvshrink's `BUILD`, which increments on every build handed over, so
+  it reads "3.72 (26)". MVC2SBS has no BUILD of its own because it ships one
+  binary per version, so it carries the version with the dot removed, "3.72
+  (372)", which still increases with every release. Checked by
+  tests/test_bundle_version.py, verified by putting the constant back.
+- **Both replace modes are off the untested list.** Run on real films from the
+  GUI. `_replaced` moved the original into a folder beside the film at full
+  size and gave the new file its name. `--in-situ`, which had never been run
+  at all, then replaced a file with the film on a NAS and scratch on a local
+  disk. That is the cross-filesystem case `land_output` exists for, and the
+  one worth testing deliberately: a rename across filesystems is a copy, so
+  the finished encode is landed on the destination volume and checked whole
+  before anything is renamed. The app and the docs no longer describe replace
+  in place as untested.
+
+
 ## 3.72
 
 - **The banding risk is printed on a single file run**, not only written into

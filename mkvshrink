@@ -21,13 +21,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-VERSION="3.72"
+VERSION="3.73"
 # Increments on every build handed over, including ones that never reach a
 # release. VERSION alone answers "which release", and during a week of
 # iteration that is eight different scripts all claiming 3.26. BUILD is what
 # tells you which of them wrote a given file, and it is stamped into the
 # output for exactly that reason.
-BUILD="26"
+BUILD="27"
 
 # ------------------------------- defaults ----------------------------------
 ENCODER=vt            # vt | x265

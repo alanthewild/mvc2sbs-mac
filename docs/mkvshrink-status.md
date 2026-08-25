@@ -46,12 +46,17 @@ review at time of writing).
 That covers: probe, encode, mux, geometry restore, verification, and
 `--keep-originals`. It is the core path and it works.
 
+**Both replace modes, on real media.** Run from the GUI. `_replaced` moved
+the original into a folder beside the film at full size and gave the new file
+its name. `--in-situ` then replaced a file with the film on a NAS and scratch
+on a local disk, which is the cross-filesystem case `land_output` exists for:
+the finished encode is copied onto the destination volume and checked whole
+before anything is renamed, because a rename across filesystems is a copy and
+is neither atomic nor instant. Both had only ever been exercised
+synthetically, and in-situ had never been run at all.
+
 ## Untested
 
-- **`--in-situ`.** Never run. The `land_output` cross-filesystem safety was
-  tested with synthetic files on two real filesystems, but not in this mode on
-  real media.
-- **`_replaced` folder mode on real media.** Tested synthetically only.
 - **The strip-only branch on a real already-HEVC file.** The `already-hevc`
   skip fires correctly in plans, but a strip-only remux has not been run.
 - **StereoMode and Full-SBS geometry.** This is the reason `mkvshrink` sits

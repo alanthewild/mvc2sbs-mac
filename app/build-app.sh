@@ -133,7 +133,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>        <string>$BUNDLE_ID</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$TOOL_VERSION</string>
-    <key>CFBundleVersion</key>           <string>1</string>
+    <!-- The version with the dot removed, so it increases with every release
+         and the About box names the build. It was hardcoded to 1, which meant
+         every app ever built reported the same one. mvc2sbs has no BUILD of
+         its own because it ships one binary per version; mkvshrink does, and
+         its bundle carries that instead. -->
+    <key>CFBundleVersion</key>           <string>${TOOL_VERSION//./}</string>
     <key>LSMinimumSystemVersion</key>    <string>13.0</string>
     <key>CFBundleIconFile</key>          <string>$NAME</string>
     <key>NSHighResolutionCapable</key>   <true/>

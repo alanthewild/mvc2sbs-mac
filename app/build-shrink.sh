@@ -96,7 +96,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleIdentifier</key>        <string>$BUNDLE_ID</string>
     <key>CFBundlePackageType</key>       <string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$TOOL_VERSION</string>
-    <key>CFBundleVersion</key>           <string>1</string>
+    <!-- mkvshrink's BUILD, which increments on every build handed over. This
+         was hardcoded to 1, so every app ever built read "3.72 (1)" and the
+         About box could not tell you which binary you were running. That is
+         the one question a build number exists to answer. -->
+    <key>CFBundleVersion</key>           <string>${TOOL_BUILD:-1}</string>
     <key>LSMinimumSystemVersion</key>    <string>13.0</string>
     <key>CFBundleIconFile</key>          <string>$NAME</string>
     <key>NSHighResolutionCapable</key>   <true/>

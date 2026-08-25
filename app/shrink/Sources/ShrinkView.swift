@@ -151,8 +151,8 @@ struct ShrinkContentView: View {
                 + "into a _replaced folder once every check has passed."
         case .insitu:
             return "About \(reclaim) of predicted saving. Each original is "
-                + "REPLACED once every check has passed. This mode is recorded "
-                + "as untested on real media."
+                + "REPLACED once every check has passed, and there is nothing "
+                + "to undo."
         }
     }
 
@@ -502,13 +502,13 @@ struct PlanRowView: View {
                     .frame(width: 56, alignment: .leading)
                     .foregroundColor(riskColour)
                     .help("Banding risk: how much of this film is both dark and low contrast. Blade Runner 2049 measured 44% and was visibly damaged; Princess Mononoke measured 25% and was clean.")
-                Text(row.reason.isEmpty ? "-" : row.reason)
+                Text(row.displayReason.isEmpty ? "-" : row.displayReason)
                     .frame(width: 190, alignment: .leading)
                     .lineLimit(1).truncationMode(.tail)
                     .foregroundColor(row.hi10p ? .accentColor : .secondary)
                     .help(row.hi10p
-                          ? "10-bit H.264. No consumer hardware decoder takes this profile, so it transcodes on playback whatever its size. Worth converting at any saving, including none.\n\n" + row.reason
-                          : row.reason)
+                          ? "10-bit H.264. No consumer hardware decoder takes this profile, so it transcodes on playback whatever its size. Worth converting at any saving, including none.\n\n" + row.displayReason
+                          : row.displayReason)
             }
             .font(.system(size: 12))
 
@@ -558,10 +558,14 @@ struct TrackSheet: View {
             Text("Ticked tracks are kept. Everything else is dropped, and that is not reversible once the original is gone.")
                 .font(.caption).foregroundColor(.secondary)
 
-            if row.dropsAudioLang {
+            // Recomputed from the ticks as they stand, not from the plan, so
+            // ticking the Japanese track back on clears the warning there and
+            // then. A warning that stays put after you have done what it asked
+            // reads as the tick having been ignored.
+            if !liveLostLangs.isEmpty {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
-                    Text("Every audio track in \(row.droppedAudioLangs) is being dropped. If one of those is the language this film was made in, tick it.")
+                    Text("Every audio track in \(liveLostLangs) is being dropped. If one of those is the language this film was made in, tick it.")
                         .font(.callout).fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(8)
@@ -593,6 +597,11 @@ struct TrackSheet: View {
                 Button("Keep these") {
                     row.audio = TrackSelection.column(audioKeep)
                     row.subs = TrackSelection.column(subKeep)
+                    // Recomputed here, where the tracks and their languages
+                    // are in hand, because the plan's reason column was
+                    // written before any of this and cannot answer for a
+                    // selection made afterwards.
+                    row.droppedLangsOverride = lostAudioLangs()
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
@@ -603,8 +612,28 @@ struct TrackSheet: View {
         .onAppear(perform: load)
     }
 
+    /// Before the track list arrives there is nothing to recompute from, so
+    /// the plan's own answer stands.
+    private var liveLostLangs: String {
+        loaded && !tracks.isEmpty ? lostAudioLangs() : row.droppedAudioLangs
+    }
+
     private func ids(_ type: String) -> [Int] {
         tracks.filter { $0.type == type }.map { $0.id }
+    }
+
+    /// The languages with no surviving audio track, in file order. The same
+    /// rule the script uses when it writes drops-audio into the plan: a
+    /// language is lost when none of its tracks is kept, not when one of them
+    /// is dropped.
+    private func lostAudioLangs() -> String {
+        let audio = tracks.filter { $0.type == "audio" }
+        let kept = Set(audio.filter { audioKeep.contains($0.id) }.map { $0.lang })
+        var lost: [String] = []
+        for t in audio where !kept.contains(t.lang) && !lost.contains(t.lang) {
+            lost.append(t.lang)
+        }
+        return lost.joined(separator: ",")
     }
 
     private func load() {
@@ -786,7 +815,7 @@ struct ShrinkPolicyBanner: View {
         case .folder:
             return "The new file takes the original's name, and the original moves to a _replaced folder beside it, once every check passes."
         case .insitu:
-            return "The original is replaced by rename and there is nothing to undo. Recorded as untested on real media."
+            return "The original is replaced by rename and there is nothing to undo. Least disk of the three, because no second copy is ever kept."
         }
     }
 

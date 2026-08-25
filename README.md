@@ -213,7 +213,7 @@ take on trust.
 | `app/make-icon.py` | Generates both icons. Needs Pillow, only if you change them. |
 | `app/MVC2SBS.icns` | The generated icon, committed so builds do not need Pillow. |
 | `app/MKVShrink.icns` | The same, for the shrink app. |
-| `tests/` | The test suite. Twelve files, each written after a real fault. |
+| `tests/` | The test suite. Thirteen files, each written after a real fault. |
 
 The scripts have no file extension because they are meant to be run as commands.
 `file mvc2sbs` will confirm they are plain text.

@@ -224,6 +224,12 @@ here that has matched what the eye saw. Measured at `--risk-samples` frames per
 file while planning, and only for files something would be done to.
 `--no-risk` turns it off.
 
+The `reason` column is a snapshot taken when the plan was written, not a
+running description. Edit the audio column and `drops-audio:jpn` stays where
+it is: the tracks you listed are what gets kept, and the reason text beside
+them is now describing a selection that no longer exists. The GUI recomputes
+it after a track edit; a hand-edited plan does not.
+
 Edit the action, audio and subs columns; delete rows to exclude them. Rows are
 matched to files by segment UID and by size as well as by path, so a plan that
 has gone stale is refused rather than applied to the wrong tracks.

@@ -183,6 +183,27 @@ for st in sorted(stages):
         failures.append(
             "mkvshrink emits stage %r and the table has no label for it" % st)
 
+# --- the reason column is a snapshot, not a fact ---------------------------
+# It is written when the plan is made and describes the selection the rules
+# made. Editing the tracks changes what will happen and cannot change a string
+# that was written beforehand, so the table has to render the recomputed one.
+# Rendering `reason` there told the user their edit had done nothing, on the
+# one edit that exists to save something irreplaceable.
+if "var displayReason" not in MODEL:
+    failures.append("PlanRow has no displayReason, so the table can only show "
+                    "the reason the plan was written with")
+if "droppedLangsOverride" not in MODEL:
+    failures.append("nothing recomputes which languages are lost after an edit")
+
+row_view = re.search(r"struct PlanRowView: View \{(.*?)\n\}", VIEW, re.S)
+if not row_view:
+    failures.append("cannot find PlanRowView in ShrinkView.swift")
+elif re.search(r"\brow\.reason\b", row_view.group(1)):
+    failures.append(
+        "PlanRowView renders row.reason directly.\n"
+        "     That is the plan's original text and does not follow a track "
+        "edit. Use row.displayReason.")
+
 # --- defaults must agree ---------------------------------------------------
 def script_default(var):
     m = re.search(r'^%s=([^\s#]+)' % var, SCRIPT, re.M)

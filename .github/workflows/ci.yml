@@ -79,6 +79,9 @@ jobs:
       - name: MKVShrink GUI passes flags mkvshrink accepts
         run: python3 tests/test_shrink_gui.py
 
+      - name: Bundle versions name the build
+        run: python3 tests/test_bundle_version.py
+
   build-app:
     name: Build the macOS app
     runs-on: macos-14

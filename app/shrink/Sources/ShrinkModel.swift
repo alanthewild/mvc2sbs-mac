@@ -51,7 +51,7 @@ enum ReplacePolicy: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .keep: return "Writes alongside and never touches the source. Nothing is reclaimed until you delete the originals yourself, which is the point."
         case .folder: return "The original moves into a _replaced folder after every check passes. Reversible, and disk comes back when you empty it."
-        case .insitu: return "The original is replaced by rename. Least disk needed, nothing to undo. Marked untested on real media in the tool's own status notes."
+        case .insitu: return "The original is replaced by rename. Least disk needed, nothing to undo. Run on real media with the film on a NAS and scratch on a local disk, which is the cross-filesystem case the copy-back safety exists for."
         }
     }
 }
@@ -215,7 +215,43 @@ final class PlanRow: ObservableObject, Identifiable {
     /// loses every one of its tracks. That is the one selection mistake the ID
     /// columns cannot show and that nothing can undo once the original is
     /// gone, so it is flagged rather than left in a string.
-    var dropsAudioLang: Bool { reason.contains("drops-audio:") }
+    /// Which audio languages lose every one of their tracks under the
+    /// selection as it stands now.
+    ///
+    /// The plan's reason column answers this for the selection the rules made,
+    /// and it is a fixed string written before anybody touched anything. Tick
+    /// the Japanese track back on and the file does keep it, because the audio
+    /// column is what mkvshrink reads, but the row went on saying
+    /// drops-audio:jpn. The tool was right and the screen was lying, which is
+    /// the worse direction: it reads as the edit having done nothing, on the
+    /// one edit whose whole purpose is to save something irreplaceable.
+    /// Set when the track sheet is applied; nil means nothing has been edited
+    /// and the plan's own answer stands.
+    @Published var droppedLangsOverride: String?
+
+    /// True once the tracks have been chosen by hand rather than by the rules.
+    var tracksEdited: Bool { droppedLangsOverride != nil }
+
+    var dropsAudioLang: Bool { !droppedAudioLangs.isEmpty }
+
+    /// The reason column as it should read now, rather than as it read when
+    /// the plan was written.
+    var displayReason: String {
+        guard tracksEdited else { return reason }
+        // Everything before the marker is the plan's own reasoning and still
+        // stands: below-psnr-floor does not change because a track was ticked.
+        var head = reason
+        if let r = reason.range(of: "drops-audio:") {
+            head = String(reason[..<r.lowerBound])
+        }
+        head = head.trimmingCharacters(in: CharacterSet(charactersIn: ", "))
+        var parts = (head.isEmpty || head == "-") ? [] : [head]
+        if !droppedAudioLangs.isEmpty {
+            parts.append("drops-audio:" + droppedAudioLangs)
+        }
+        parts.append("tracks edited")
+        return parts.joined(separator: ",")
+    }
 
     /// 10-bit H.264, which no consumer hardware decoder will take. The gates
     /// here measure bytes, and this file's problem is not bytes: it transcodes
@@ -228,6 +264,7 @@ final class PlanRow: ObservableObject, Identifiable {
     /// last precisely because the language list it carries is comma separated
     /// too.
     var droppedAudioLangs: String {
+        if let o = droppedLangsOverride { return o }
         guard let r = reason.range(of: "drops-audio:") else { return "" }
         return String(reason[r.upperBound...])
     }
