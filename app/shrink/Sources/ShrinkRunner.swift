@@ -81,13 +81,49 @@ final class ShrinkController: ObservableObject {
 
     func clearLog() {
         log = ""
+        notes = []
         noteCount = 0
     }
 
     func appendLog(_ s: String) {
         log.append(s)
-        // A sweep of a thousand files produces a lot of output.
-        if log.count > 400_000 { log = String(log.suffix(200_000)) }
+        // A sweep produces a lot of output, and the encoder is the noisiest
+        // part of it. The old ceiling was 400k, which eight films overran: the
+        // one that failed had scrolled off by the time anyone went looking.
+        // A few megabytes of text is nothing to an NSTextView, and the notes
+        // below are kept whatever happens to this.
+        if log.count > 4_000_000 { log = String(log.suffix(2_000_000)) }
+    }
+
+    /// Warnings and errors, kept separately and never trimmed.
+    ///
+    /// The console rolls, and what rolls off first is the beginning of the run,
+    /// which is exactly where the failure you are looking for usually is. These
+    /// are a few hundred bytes each and there are rarely more than a handful,
+    /// so there is no reason to throw them away with the encoder chatter.
+    @Published var notes: [String] = []
+    /// Set when the console is opened from a note count, so it opens on the
+    /// thing that was clicked rather than on four thousand lines of x265.
+    @Published var consoleWarningsOnly = false
+
+    private func noteLine(_ line: String) {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("WARN:") || t.hasPrefix("ERROR:") {
+            notes.append(line)
+        } else if !notes.isEmpty, line.hasPrefix("      "), !t.isEmpty {
+            // mkvshrink's warnings are paragraphs: the continuation lines are
+            // indented and carry the half of the sentence that says what to do
+            // about it. Splitting them off would leave the useful half here
+            // and the actionable half in the log.
+            notes[notes.count - 1] += "\n" + line
+        }
+        if notes.count > 2000 { notes.removeFirst(notes.count - 2000) }
+    }
+
+    var notesText: String {
+        notes.isEmpty
+            ? "No warnings or errors in this run."
+            : notes.joined(separator: "\n\n")
     }
 
     // MARK: - Planning
@@ -325,7 +361,9 @@ final class ShrinkController: ObservableObject {
         while let nl = stderrBuffer.firstIndex(of: 0x0A) {
             let line = String(data: stderrBuffer[..<nl], encoding: .utf8) ?? ""
             stderrBuffer.removeSubrange(...nl)
-            appendLog(strippingColour(line) + "\n")
+            let clean = strippingColour(line)
+            appendLog(clean + "\n")
+            noteLine(clean)
         }
     }
 

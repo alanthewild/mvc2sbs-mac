@@ -101,8 +101,9 @@ for t in tests/*.py; do python3 "$t" || echo "FAIL $t"; done
 bash tests/test_install.sh
 shellcheck -S warning mvc2sbs mkvdiff mkvshrink install-mac3d.sh
 
-# apps
-cd app && ./build-app.sh && ./build-shrink.sh
+# apps. --install also copies the bundle into /Applications, which is what
+# Alan runs, so a build without it changes nothing he can see.
+cd app && ./build-app.sh --install && ./build-shrink.sh --install
 
 # icons, only if changing them, needs Pillow
 python3 app/make-icon.py

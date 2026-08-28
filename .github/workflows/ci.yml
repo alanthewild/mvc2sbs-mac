@@ -82,6 +82,18 @@ jobs:
       - name: Bundle versions name the build
         run: python3 tests/test_bundle_version.py
 
+  length-check:
+    name: The length check measures the picture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg and mkvtoolnix
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg mkvtoolnix
+
+      - name: A dropped track running past the picture is not drift
+        run: python3 tests/test_length_check.py
+
   build-app:
     name: Build the macOS app
     runs-on: macos-14

@@ -1,5 +1,49 @@
 # Changelog
 
+## 3.74
+
+- **A remux was failed for drift it did not have.** The length check compared
+  container durations, and a container is as long as its longest stream. Any
+  release with an audio or subtitle track running past the end of the picture
+  therefore reports more than the film, and dropping that track makes the
+  output legitimately shorter. Evangelion Death (True)² failed verification at
+  -1.87s on a strip-only pass, where the video was copied and never touched.
+  The check now measures the video track on both sides, reading Matroska's
+  per-track DURATION tag, which is where the answer actually lives, and says
+  which basis it used. Reproduced here first, at -1.98s on a synthetic file
+  whose only fault was a Spanish track two seconds longer than the picture.
+  Where no track duration is readable it still falls back to the container and
+  now says so, and says that a shorter output after dropping tracks may be
+  arithmetic rather than damage.
+- **mkvdiff reports track durations.** `v.duration` from Matroska's per-track
+  DURATION tag, and each audio line now carries its own length. On the
+  Evangelion comparison that turns a page of differing fields into one
+  readable answer: the picture is 4141.30s on both sides and the Italian
+  tracks that ran past it are gone. The container duration alone could not say
+  whether the film had been shortened or a track had been dropped.
+- **A rejected file leaves one file behind, not three.** The chapter and tag
+  XML was kept alongside the output whenever verification failed, in the media
+  folder if that is where the work happened. It is rebuilt every run and is no
+  use to anyone inspecting a failure, so it now goes whatever the outcome and
+  only the output the message names is preserved. The failure paths that
+  skipped cleanup entirely now call it.
+- **tests/test_length_check.py** builds that file, strips it, and fails if the
+  check reads the container or rejects the remux. Verified against the old
+  script, which fails it.
+- **The console holds a sweep now, and keeps every warning whatever happens.**
+  The buffer was 400k characters, which eight films overran, so the one that
+  failed had scrolled off before anyone went looking. It is now a few
+  megabytes, and warnings and errors are kept in a separate list that is never
+  trimmed, whole paragraphs included. The console has an Everything or
+  Warnings switch, and the note count in the status bar opens straight onto
+  the warnings rather than onto four thousand lines of encoder output.
+- **The install instructions name `--install` and say what it does.** The
+  README's build line omitted it in one place and never mentioned
+  `build-shrink.sh` at all, so following it built both bundles in `app/` and
+  left the copies in /Applications untouched. Someone then tests the old app
+  and reports the fix missing.
+
+
 ## 3.73
 
 - **Ticking a dropped language back on did not clear the warning.** The reason

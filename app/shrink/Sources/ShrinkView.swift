@@ -235,7 +235,10 @@ struct ShrinkContentView: View {
             Spacer()
 
             ShrinkToolButton(title: "Console", symbol: "terminal", tint: .teal,
-                             help: "Everything mkvshrink printed") { ctl.consoleVisible = true }
+                             help: "Everything mkvshrink printed") {
+                ctl.consoleWarningsOnly = false
+                ctl.consoleVisible = true
+            }
             ShrinkToolButton(title: "Settings", symbol: "gearshape", tint: .cyan,
                              help: "Encoder, gates, track rules and what happens to originals") {
                 showSettings = true
@@ -273,6 +276,7 @@ struct ShrinkContentView: View {
                 ProgressView().progressViewStyle(.linear).frame(width: 320)
                 if ctl.noteCount > 0 {
                     Button {
+                        ctl.consoleWarningsOnly = true
                         ctl.consoleVisible = true
                     } label: {
                         Label("\(ctl.noteCount) note\(ctl.noteCount == 1 ? "" : "s") so far, open the Console to read them",
@@ -727,6 +731,10 @@ struct ShrinkStatusBar: View {
             // in paragraphs, and a third of a paragraph is not information.
             if ctl.noteCount > 0 {
                 Button {
+                    // Straight to the warnings. Opening four thousand lines of
+                    // encoder output and asking someone to find the one that
+                    // was counted is not an answer.
+                    ctl.consoleWarningsOnly = true
                     ctl.consoleVisible = true
                 } label: {
                     Text("\(ctl.noteCount) note\(ctl.noteCount == 1 ? "" : "s") in the Console")
@@ -862,6 +870,18 @@ struct ShrinkConsoleSheet: View {
         VStack(alignment: .leading) {
             HStack {
                 Text("Console").font(.headline)
+                // The full log rolls once a sweep gets long, and what rolls
+                // off is the start of the run. Warnings are kept whole and
+                // separately, so the file that failed four films ago is still
+                // here whatever the console has thrown away.
+                Picker("", selection: $ctl.consoleWarningsOnly) {
+                    Text("Everything").tag(false)
+                    Text(ctl.notes.isEmpty ? "Warnings"
+                         : "Warnings (\(ctl.notes.count))").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
                 Spacer()
                 Button("Save...") { save() }
                     .disabled(ctl.log.isEmpty)
@@ -874,9 +894,10 @@ struct ShrinkConsoleSheet: View {
                 }
                 Button("Close") { ctl.consoleVisible = false }
             }
-            ShrinkLogView(text: ctl.log)
+            ShrinkLogView(text: ctl.consoleWarningsOnly ? ctl.notesText : ctl.log)
                 .background(Color.black.opacity(0.25))
-            Text("Every run also writes its own log to " + ShrinkController.logDir)
+            Text("Every run also writes its own log to " + ShrinkController.logDir
+                 + ". This window keeps the last few megabytes; the file keeps all of it.")
                 .font(.caption).foregroundColor(.secondary)
                 .textSelection(.enabled)
         }

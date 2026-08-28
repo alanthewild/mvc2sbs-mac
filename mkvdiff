@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-VERSION="3.73"
+VERSION="3.74"
 
 TMPDIR_ERR="$(mktemp "${TMPDIR:-/tmp}/mkvdiff.err.XXXXXX")"
 trap 'rm -f "$TMPDIR_ERR"' EXIT
@@ -56,6 +56,35 @@ for _tk, _tv in _ftags.items():          # not k, v: v is the video stream below
         out["mvc2sbs.settings"] = str(_tv)
 out["mvc2sbs.version"] = _enc or "not stamped"
 out["container_dur"]  = probe.get("format", {}).get("duration", "?")
+
+
+def track_dur(st):
+    """A track's own length in seconds.
+
+    The container's duration is its longest stream, so on a file whose audio
+    runs past the picture it answers a different question from the one being
+    asked. Matroska almost always leaves stream duration unset and writes a
+    DURATION tag per track instead, so that is the answer here and the stream
+    field is the fallback. Without this, a strip that dropped a long track
+    showed as a container that had shrunk, with nothing on the page to say
+    whether the picture had.
+    """
+    d = (st.get("tags", {}) or {}).get("DURATION") or \
+        (st.get("tags", {}) or {}).get("duration")
+    if d and ":" in str(d):
+        try:
+            h, m, sec = str(d).split(":")
+            return "%.3f" % (float(h) * 3600 + float(m) * 60 + float(sec))
+        except Exception:
+            pass
+    d = st.get("duration")
+    try:
+        return "%.3f" % float(d)
+    except Exception:
+        return "?"
+
+
+out["v.duration"]     = track_dur(v)
 out["v.codec"]        = v.get("codec_name", "?")
 out["v.profile"]      = v.get("profile", "?")
 out["v.level"]        = str(v.get("level", "?"))
@@ -88,9 +117,10 @@ out["sub_tracks"]     = str(sum(1 for s in streams if s.get("codec_type") == "su
 for i, a in enumerate([s for s in streams if s.get("codec_type") == "audio"]):
     name = a.get("codec_name", "?")
     prof = a.get("profile", "")
-    out["a%d" % i] = "%s%s %sch %s" % (
+    out["a%d" % i] = "%s%s %sch %s %ss" % (
         name, (" " + prof) if prof else "",
-        a.get("channels", "?"), a.get("tags", {}).get("language", "und"))
+        a.get("channels", "?"), a.get("tags", {}).get("language", "und"),
+        track_dur(a))
 
 sub = next((s for s in streams if s.get("codec_type") == "subtitle"), None)
 out["sub.size"] = f"{sub.get('width','?')}x{sub.get('height','?')}" if sub else "n/a"

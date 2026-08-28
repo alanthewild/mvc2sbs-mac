@@ -120,9 +120,14 @@ Intel Macs will build and run but have not been tested.
 ```sh
 git clone https://github.com/alanthewild/mvc2sbs-mac.git
 cd mvc2sbs-mac
-./install-mac3d.sh            # CLI tools into ~/.local/bin
-cd app && ./build-app.sh --install   # the Mac app into /Applications
+./install-mac3d.sh                     # CLI tools into ~/.local/bin
+cd app
+./build-app.sh --install               # MVC2SBS.app into /Applications
+./build-shrink.sh --install            # MKVShrink.app into /Applications
 ```
+
+Without `--install` the bundle is built in `app/` and left there, so the copy
+in /Applications is still the old one.
 
 The app bundles `mvc2sbs`, `pgs3d.py`, `mkvdiff`, `subs3d` and the MVC decoder
 inside itself, so it
@@ -213,7 +218,7 @@ take on trust.
 | `app/make-icon.py` | Generates both icons. Needs Pillow, only if you change them. |
 | `app/MVC2SBS.icns` | The generated icon, committed so builds do not need Pillow. |
 | `app/MKVShrink.icns` | The same, for the shrink app. |
-| `tests/` | The test suite. Thirteen files, each written after a real fault. |
+| `tests/` | The test suite. Fourteen files, each written after a real fault. |
 
 The scripts have no file extension because they are meant to be run as commands.
 `file mvc2sbs` will confirm they are plain text.
@@ -1027,6 +1032,7 @@ chapters. See the chapters section above.
 python3 tests/test_pgs3d.py    # builds a synthetic PGS stream and verifies it
 shellcheck -S warning mvc2sbs mkvdiff mkvshrink install-mac3d.sh app/build-app.sh
 cd app && ./build-app.sh       # builds the app, fetching the decoder if needed
+                               # add --install to replace the one in /Applications
 python3 -m pip install pillow  # only needed to regenerate the icon
 python3 app/make-icon.py       # regenerates MVC2SBS.icns and MKVShrink.icns
 ```

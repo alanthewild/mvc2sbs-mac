@@ -21,13 +21,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
-VERSION="3.73"
+VERSION="3.74"
 # Increments on every build handed over, including ones that never reach a
 # release. VERSION alone answers "which release", and during a week of
 # iteration that is eight different scripts all claiming 3.26. BUILD is what
 # tells you which of them wrote a given file, and it is stamped into the
 # output for exactly that reason.
-BUILD="27"
+BUILD="28"
 
 # ------------------------------- defaults ----------------------------------
 ENCODER=vt            # vt | x265
@@ -1294,14 +1294,52 @@ CUESPY
 # file plays. Every one of these checks corresponds to a file that passed the
 # exit status and was still broken.
 # verify_output SRC OUT -> 0 pass, 1 fail. Sets V_NOTES.
+# The video track's own length, in seconds.
+#
+# Not the container's. A container reports its longest stream, so a file whose
+# Spanish audio runs two seconds past the picture reports two seconds more than
+# the film, and dropping that track makes the output legitimately "shorter"
+# than the source. That is not drift, it is arithmetic, and it failed a
+# perfectly good remux of Evangelion Death (True)² at -1.87s.
+#
+# Matroska almost always leaves stream duration unset and writes a DURATION tag
+# per track instead, so the tag is the answer here and the stream field is the
+# fallback rather than the other way round. Echoes nothing if neither is
+# readable, and the caller then falls back to the container for both files,
+# which is still a like-for-like comparison.
+video_duration() {
+  local f="$1" d
+  d="$(ffprobe -v error -select_streams v:0 -show_entries stream_tags=DURATION \
+       -of default=nw=1:nk=1 "$f" 2>/dev/null | head -1 | tr -d '[:space:]')"
+  if [[ "$d" == *:* ]]; then
+    python3 -c '
+import sys
+p = sys.argv[1].split(":")
+try:
+    print("%.3f" % (float(p[0]) * 3600 + float(p[1]) * 60 + float(p[2])))
+except Exception:
+    pass' "$d"
+    return 0
+  fi
+  d="$(ffprobe -v error -select_streams v:0 -show_entries stream=duration \
+       -of default=nw=1:nk=1 "$f" 2>/dev/null | head -1 | tr -d '[:space:],')"
+  [[ "$d" =~ ^[0-9.]+$ ]] && echo "$d"
+  return 0
+}
+
 verify_output() {
   local src="$1" out="$2" fail=0
   V_NOTES=""
-  local sd od
-  sd="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$src" \
-        2>/dev/null | head -1 | tr -d '[:space:],')"
-  od="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$out" \
-        2>/dev/null | head -1 | tr -d '[:space:],')"
+  local sd od basis="video track"
+  sd="$(video_duration "$src")"
+  od="$(video_duration "$out")"
+  if [[ ! "$sd" =~ ^[0-9.]+$ || ! "$od" =~ ^[0-9.]+$ ]]; then
+    basis="container"
+    sd="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$src" \
+          2>/dev/null | head -1 | tr -d '[:space:],')"
+    od="$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$out" \
+          2>/dev/null | head -1 | tr -d '[:space:],')"
+  fi
   if [[ "$sd" =~ ^[0-9.]+$ && "$od" =~ ^[0-9.]+$ ]]; then
     local verdict
     verdict="$(python3 -c '
@@ -1313,10 +1351,15 @@ print("%.2f %.2f %+.2f %s" % (a, b, d, "ok" if abs(d) <= 1.0 else "drift"))
     read -r _s _o _d _v <<<"$verdict"
     if [[ "$_v" != "ok" ]]; then
       fail=1; V_NOTES="${V_NOTES}length drift ${_d}s; "
-      warn "Length check: source ${_s}s but output ${_o}s (${_d}s). The video is
-      not the same length as the source, so the audio will drift."
+      warn "Length check (${basis}): source ${_s}s but output ${_o}s (${_d}s).
+      The video is not the same length as the source, so the audio will drift.$(
+        [[ "$basis" == "container" ]] && printf '%s' "
+      Measured on the container because the video track carries no duration,
+      and a container is as long as its longest stream. If tracks were dropped
+      and one of them ran past the picture, a shorter output is arithmetic
+      rather than damage. Check with: mkvdiff SOURCE OUTPUT")"
     else
-      say "Length check: source ${_s}s, output ${_o}s (${_d}s)"
+      say "Length check (${basis}): source ${_s}s, output ${_o}s (${_d}s)"
     fi
   else
     fail=1; V_NOTES="${V_NOTES}length unreadable; "
@@ -1468,9 +1511,16 @@ shrink_one() {
   out="${work}/${base}.mkvshrink.new.mkv"
 
   local keepwork=0
-  cleanup_one() { [[ $keepwork -eq 1 ]] || rm -f "$stage" "$out" "${work}/${base}.chapters.xml" \
-                    "${work}/${base}.tags.xml" "${work}/${base}.srctags.xml" \
-                    "${dir}/${base}.mkvshrink.landing.mkv"; }
+  # The XML is scratch whatever happens: it is rebuilt on every run and it is
+  # of no use to anybody inspecting a failure. Keeping it meant a rejected file
+  # left three files behind in the media folder rather than the one the message
+  # names. Only the output itself is preserved for inspection.
+  cleanup_one() {
+    rm -f "${work}/${base}.chapters.xml" "${work}/${base}.tags.xml" \
+          "${work}/${base}.srctags.xml"
+    [[ $keepwork -eq 1 ]] || rm -f "$stage" "$out" \
+          "${dir}/${base}.mkvshrink.landing.mkv"
+  }
 
   local t0; t0=$(date +%s)
   local settings="tracks=$tracksrc"
@@ -1627,7 +1677,7 @@ shrink_one() {
       The original is untouched. The failed output is at:
         $out"
     mach "@@failed $src"
-    return 1
+    cleanup_one; return 1
   fi
 
   if [[ $VERIFY_FULL -eq 1 && "$action" == "shrink" ]]; then
@@ -1640,7 +1690,7 @@ shrink_one() {
       keepwork=1
       warn "Full-file PSNR ${fp} dB is below the ${MINPSNR} dB floor. Rejected.
       The original is untouched. The output is at: $out"
-      return 1
+      cleanup_one; return 1
     fi
     say "Full-file PSNR: ${fp} dB"
   fi
@@ -1661,7 +1711,7 @@ print("%.1f" % (100.0*(o-n)/o) if o else "0.0")' "$oldsize" "$newsize")"
   # first, check it arrived whole, and only then start moving things around.
   if ! out="$(land_output "$out" "$dir" "$base")"; then
     warn "could not copy the finished file to $dir, leaving everything alone"
-    keepwork=1; return 1
+    keepwork=1; cleanup_one; return 1
   fi
 
   # The last step, and until now an invisible one: on a large file the copy and
@@ -1694,7 +1744,7 @@ print("%.1f" % (100.0*(o-n)/o) if o else "0.0")' "$oldsize" "$newsize")"
       # been written, and that is the moment the disk fills up.
       if ! mv -f "$src" "${rdir}/$(basename "$src")"; then
         warn "could not move the original aside, leaving everything alone"
-        keepwork=1; return 1
+        keepwork=1; cleanup_one; return 1
       fi
       mv -f "$out" "${dir}/$(basename "${src%.*}").mkv"
       say "Replaced $(basename "$src"), saving ${saved}%. Original in $(basename "$rdir")/"
